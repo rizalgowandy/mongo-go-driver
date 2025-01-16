@@ -10,7 +10,7 @@ import (
 	"errors"
 	"io"
 
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 )
 
 // ErrNilReader indicates that an operation was attempted on a nil bson.Reader.
@@ -27,14 +27,6 @@ type Raw []byte
 func ReadDocument(r io.Reader) (Raw, error) {
 	doc, err := bsoncore.NewDocumentFromReader(r)
 	return Raw(doc), err
-}
-
-// NewFromIOReader reads a BSON document from the io.Reader and returns it as a bson.Raw. If the
-// reader contains multiple BSON documents, only the first document is read.
-//
-// Deprecated: Use ReadDocument instead.
-func NewFromIOReader(r io.Reader) (Raw, error) {
-	return ReadDocument(r)
 }
 
 // Validate validates the document. This method only validates the first document in
@@ -60,12 +52,19 @@ func (r Raw) LookupErr(key ...string) (RawValue, error) {
 // elements. If the document is not valid, the elements up to the invalid point will be returned
 // along with an error.
 func (r Raw) Elements() ([]RawElement, error) {
-	elems, err := bsoncore.Document(r).Elements()
+	doc := bsoncore.Document(r)
+	if len(doc) == 0 {
+		return nil, nil
+	}
+	elems, err := doc.Elements()
+	if err != nil {
+		return nil, err
+	}
 	relems := make([]RawElement, 0, len(elems))
 	for _, elem := range elems {
 		relems = append(relems, RawElement(elem))
 	}
-	return relems, err
+	return relems, nil
 }
 
 // Values returns this document as a slice of values. The returned slice will contain valid values.

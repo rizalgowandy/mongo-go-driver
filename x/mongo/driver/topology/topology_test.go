@@ -9,7 +9,6 @@ package topology
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"path"
@@ -17,26 +16,18 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/internal/assert"
-	"go.mongodb.org/mongo-driver/internal/require"
-	"go.mongodb.org/mongo-driver/internal/spectest"
-	"go.mongodb.org/mongo-driver/mongo/address"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/internal/assert"
+	"go.mongodb.org/mongo-driver/v2/internal/require"
+	"go.mongodb.org/mongo-driver/v2/internal/serverselector"
+	"go.mongodb.org/mongo-driver/v2/internal/spectest"
+	"go.mongodb.org/mongo-driver/v2/mongo/address"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
 )
 
 const testTimeout = 2 * time.Second
-
-func noerr(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-		t.FailNow()
-	}
-}
 
 func compareErrors(err1, err2 error) bool {
 	if err1 == nil && err2 == nil {
@@ -55,36 +46,31 @@ func compareErrors(err1, err2 error) bool {
 }
 
 func TestServerSelection(t *testing.T) {
-	var selectFirst description.ServerSelectorFunc = func(_ description.Topology, candidates []description.Server) ([]description.Server, error) {
+	var selectFirst serverselector.Func = func(_ description.Topology, candidates []description.Server) ([]description.Server, error) {
 		if len(candidates) == 0 {
 			return []description.Server{}, nil
 		}
 		return candidates[0:1], nil
 	}
-	var selectNone description.ServerSelectorFunc = func(description.Topology, []description.Server) ([]description.Server, error) {
+	var selectNone serverselector.Func = func(description.Topology, []description.Server) ([]description.Server, error) {
 		return []description.Server{}, nil
-	}
-	var errSelectionError = errors.New("encountered an error in the selector")
-	var selectError description.ServerSelectorFunc = func(description.Topology, []description.Server) ([]description.Server, error) {
-		return nil, errSelectionError
 	}
 
 	t.Run("Success", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		desc := description.Topology{
 			Servers: []description.Server{
-				{Addr: address.Address("one"), Kind: description.Standalone},
-				{Addr: address.Address("two"), Kind: description.Standalone},
-				{Addr: address.Address("three"), Kind: description.Standalone},
+				{Addr: address.Address("one"), Kind: description.ServerKindStandalone},
+				{Addr: address.Address("two"), Kind: description.ServerKindStandalone},
+				{Addr: address.Address("three"), Kind: description.ServerKindStandalone},
 			},
 		}
 		subCh := make(chan description.Topology, 1)
 		subCh <- desc
 
-		state := newServerSelectionState(selectFirst, nil)
-		srvs, err := topo.selectServerFromSubscription(context.Background(), subCh, state)
-		noerr(t, err)
+		srvs, err := topo.selectServerFromSubscription(context.Background(), subCh, selectFirst)
+		require.NoError(t, err)
 		if len(srvs) != 1 {
 			t.Errorf("Incorrect number of descriptions returned. got %d; want %d", len(srvs), 1)
 		}
@@ -94,13 +80,13 @@ func TestServerSelection(t *testing.T) {
 	})
 	t.Run("Compatibility Error Min Version Too High", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		desc := description.Topology{
-			Kind: description.Single,
+			Kind: description.TopologyKindSingle,
 			Servers: []description.Server{
-				{Addr: address.Address("one:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 11, Min: 11}},
-				{Addr: address.Address("two:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 6}},
-				{Addr: address.Address("three:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 6}},
+				{Addr: address.Address("one:27017"), Kind: description.ServerKindStandalone, WireVersion: &description.VersionRange{Max: 11, Min: 11}},
+				{Addr: address.Address("two:27017"), Kind: description.ServerKindStandalone, WireVersion: &description.VersionRange{Max: 9, Min: 6}},
+				{Addr: address.Address("three:27017"), Kind: description.ServerKindStandalone, WireVersion: &description.VersionRange{Max: 9, Min: 6}},
 			},
 		}
 		want := fmt.Errorf(
@@ -117,13 +103,13 @@ func TestServerSelection(t *testing.T) {
 	})
 	t.Run("Compatibility Error Max Version Too Low", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		desc := description.Topology{
-			Kind: description.Single,
+			Kind: description.TopologyKindSingle,
 			Servers: []description.Server{
-				{Addr: address.Address("one:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 21, Min: 6}},
-				{Addr: address.Address("two:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
-				{Addr: address.Address("three:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
+				{Addr: address.Address("one:27017"), Kind: description.ServerKindStandalone, WireVersion: &description.VersionRange{Max: 21, Min: 6}},
+				{Addr: address.Address("two:27017"), Kind: description.ServerKindStandalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
+				{Addr: address.Address("three:27017"), Kind: description.ServerKindStandalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
 			},
 		}
 		want := fmt.Errorf(
@@ -140,24 +126,23 @@ func TestServerSelection(t *testing.T) {
 	})
 	t.Run("Updated", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		desc := description.Topology{Servers: []description.Server{}}
 		subCh := make(chan description.Topology, 1)
 		subCh <- desc
 
 		resp := make(chan []description.Server)
 		go func() {
-			state := newServerSelectionState(selectFirst, nil)
-			srvs, err := topo.selectServerFromSubscription(context.Background(), subCh, state)
-			noerr(t, err)
+			srvs, err := topo.selectServerFromSubscription(context.Background(), subCh, selectFirst)
+			require.NoError(t, err)
 			resp <- srvs
 		}()
 
 		desc = description.Topology{
 			Servers: []description.Server{
-				{Addr: address.Address("one"), Kind: description.Standalone},
-				{Addr: address.Address("two"), Kind: description.Standalone},
-				{Addr: address.Address("three"), Kind: description.Standalone},
+				{Addr: address.Address("one"), Kind: description.ServerKindStandalone},
+				{Addr: address.Address("two"), Kind: description.ServerKindStandalone},
+				{Addr: address.Address("three"), Kind: description.ServerKindStandalone},
 			},
 		}
 		select {
@@ -183,20 +168,19 @@ func TestServerSelection(t *testing.T) {
 	t.Run("Cancel", func(t *testing.T) {
 		desc := description.Topology{
 			Servers: []description.Server{
-				{Addr: address.Address("one"), Kind: description.Standalone},
-				{Addr: address.Address("two"), Kind: description.Standalone},
-				{Addr: address.Address("three"), Kind: description.Standalone},
+				{Addr: address.Address("one"), Kind: description.ServerKindStandalone},
+				{Addr: address.Address("two"), Kind: description.ServerKindStandalone},
+				{Addr: address.Address("three"), Kind: description.ServerKindStandalone},
 			},
 		}
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		subCh := make(chan description.Topology, 1)
 		subCh <- desc
 		resp := make(chan error)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
-			state := newServerSelectionState(selectNone, nil)
-			_, err := topo.selectServerFromSubscription(ctx, subCh, state)
+			_, err := topo.selectServerFromSubscription(ctx, subCh, selectNone)
 			resp <- err
 		}()
 
@@ -217,172 +201,41 @@ func TestServerSelection(t *testing.T) {
 		want := ServerSelectionError{Wrapped: context.Canceled, Desc: desc}
 		assert.Equal(t, err, want, "Incorrect error received. got %v; want %v", err, want)
 	})
-	t.Run("Timeout", func(t *testing.T) {
-		desc := description.Topology{
-			Servers: []description.Server{
-				{Addr: address.Address("one"), Kind: description.Standalone},
-				{Addr: address.Address("two"), Kind: description.Standalone},
-				{Addr: address.Address("three"), Kind: description.Standalone},
-			},
-		}
-		topo, err := New(nil)
-		noerr(t, err)
-		subCh := make(chan description.Topology, 1)
-		subCh <- desc
-		resp := make(chan error)
-		timeout := make(chan time.Time)
-		go func() {
-			state := newServerSelectionState(selectNone, timeout)
-			_, err := topo.selectServerFromSubscription(context.Background(), subCh, state)
-			resp <- err
-		}()
-
-		select {
-		case err := <-resp:
-			t.Errorf("Received error from server selection too soon: %v", err)
-		case timeout <- time.Now():
-		}
-
-		select {
-		case err = <-resp:
-		case <-time.After(100 * time.Millisecond):
-			t.Errorf("Timed out while trying to retrieve selected servers")
-		}
-
-		if err == nil {
-			t.Fatalf("did not receive error from server selection")
-		}
-	})
-	t.Run("Error", func(t *testing.T) {
-		desc := description.Topology{
-			Servers: []description.Server{
-				{Addr: address.Address("one"), Kind: description.Standalone},
-				{Addr: address.Address("two"), Kind: description.Standalone},
-				{Addr: address.Address("three"), Kind: description.Standalone},
-			},
-		}
-		topo, err := New(nil)
-		noerr(t, err)
-		subCh := make(chan description.Topology, 1)
-		subCh <- desc
-		resp := make(chan error)
-		timeout := make(chan time.Time)
-		go func() {
-			state := newServerSelectionState(selectError, timeout)
-			_, err := topo.selectServerFromSubscription(context.Background(), subCh, state)
-			resp <- err
-		}()
-
-		select {
-		case err = <-resp:
-		case <-time.After(100 * time.Millisecond):
-			t.Errorf("Timed out while trying to retrieve selected servers")
-		}
-
-		if err == nil {
-			t.Fatalf("did not receive error from server selection")
-		}
-	})
 	t.Run("findServer returns topology kind", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		atomic.StoreInt64(&topo.state, topologyConnected)
-		srvr, err := ConnectServer(address.Address("one"), topo.updateCallback, topo.id)
-		noerr(t, err)
+		srvr, err := ConnectServer(address.Address("one"), topo.updateCallback, topo.id, defaultConnectionTimeout)
+		require.NoError(t, err)
 		topo.servers[address.Address("one")] = srvr
 		desc := topo.desc.Load().(description.Topology)
-		desc.Kind = description.Single
+		desc.Kind = description.TopologyKindSingle
 		topo.desc.Store(desc)
 
 		selected := description.Server{Addr: address.Address("one")}
 
 		ss, err := topo.FindServer(selected)
-		noerr(t, err)
-		if ss.Kind != description.Single {
-			t.Errorf("findServer does not properly set the topology description kind. got %v; want %v", ss.Kind, description.Single)
-		}
-	})
-	t.Run("Update on not primary error", func(t *testing.T) {
-		topo, err := New(nil)
-		noerr(t, err)
-		atomic.StoreInt64(&topo.state, topologyConnected)
-
-		addr1 := address.Address("one")
-		addr2 := address.Address("two")
-		addr3 := address.Address("three")
-		desc := description.Topology{
-			Servers: []description.Server{
-				{Addr: addr1, Kind: description.RSPrimary},
-				{Addr: addr2, Kind: description.RSSecondary},
-				{Addr: addr3, Kind: description.RSSecondary},
-			},
-		}
-
-		// manually add the servers to the topology
-		for _, srv := range desc.Servers {
-			s, err := ConnectServer(srv.Addr, topo.updateCallback, topo.id)
-			noerr(t, err)
-			topo.servers[srv.Addr] = s
-		}
-
-		// Send updated description
-		desc = description.Topology{
-			Servers: []description.Server{
-				{Addr: addr1, Kind: description.RSSecondary},
-				{Addr: addr2, Kind: description.RSPrimary},
-				{Addr: addr3, Kind: description.RSSecondary},
-			},
-		}
-
-		subCh := make(chan description.Topology, 1)
-		subCh <- desc
-
-		// send a not primary error to the server forcing an update
-		serv, err := topo.FindServer(desc.Servers[0])
-		noerr(t, err)
-		atomic.StoreInt64(&serv.state, serverConnected)
-		_ = serv.ProcessError(driver.Error{Message: driver.LegacyNotPrimaryErrMsg}, initConnection{})
-
-		resp := make(chan []description.Server)
-
-		go func() {
-			// server selection should discover the new topology
-			state := newServerSelectionState(description.WriteSelector(), nil)
-			srvs, err := topo.selectServerFromSubscription(context.Background(), subCh, state)
-			noerr(t, err)
-			resp <- srvs
-		}()
-
-		var srvs []description.Server
-		select {
-		case srvs = <-resp:
-		case <-time.After(100 * time.Millisecond):
-			t.Errorf("Timed out while trying to retrieve selected servers")
-		}
-
-		if len(srvs) != 1 {
-			t.Errorf("Incorrect number of descriptions returned. got %d; want %d", len(srvs), 1)
-		}
-		if srvs[0].Addr != desc.Servers[1].Addr {
-			t.Errorf("Incorrect sever selected. got %s; want %s", srvs[0].Addr, desc.Servers[1].Addr)
+		require.NoError(t, err)
+		if ss.Kind != description.TopologyKindSingle {
+			t.Errorf("findServer does not properly set the topology description kind. got %v; want %v", ss.Kind, description.TopologyKindSingle)
 		}
 	})
 	t.Run("fast path does not subscribe or check timeouts", func(t *testing.T) {
 		// Assert that the server selection fast path does not create a Subscription or check for timeout errors.
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		atomic.StoreInt64(&topo.state, topologyConnected)
 
 		primaryAddr := address.Address("one")
 		desc := description.Topology{
 			Servers: []description.Server{
-				{Addr: primaryAddr, Kind: description.RSPrimary},
+				{Addr: primaryAddr, Kind: description.ServerKindRSPrimary},
 			},
 		}
 		topo.desc.Store(desc)
 		for _, srv := range desc.Servers {
-			s, err := ConnectServer(srv.Addr, topo.updateCallback, topo.id)
-			noerr(t, err)
+			s, err := ConnectServer(srv.Addr, topo.updateCallback, topo.id, defaultConnectionTimeout)
+			require.NoError(t, err)
 			topo.servers[srv.Addr] = s
 		}
 
@@ -391,14 +244,14 @@ func TestServerSelection(t *testing.T) {
 		topo.subscriptionsClosed = true
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		selectedServer, err := topo.SelectServer(ctx, description.WriteSelector())
-		noerr(t, err)
+		selectedServer, err := topo.SelectServer(ctx, &serverselector.Write{})
+		require.NoError(t, err)
 		selectedAddr := selectedServer.(*SelectedServer).address
 		assert.Equal(t, primaryAddr, selectedAddr, "expected address %v, got %v", primaryAddr, selectedAddr)
 	})
 	t.Run("default to selecting from subscription if fast path fails", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 
 		atomic.StoreInt64(&topo.state, topologyConnected)
 		desc := description.Topology{
@@ -407,7 +260,7 @@ func TestServerSelection(t *testing.T) {
 		topo.desc.Store(desc)
 
 		topo.subscriptionsClosed = true
-		_, err = topo.SelectServer(context.Background(), description.WriteSelector())
+		_, err = topo.SelectServer(context.Background(), &serverselector.Write{})
 		assert.Equal(t, ErrSubscribeAfterClosed, err, "expected error %v, got %v", ErrSubscribeAfterClosed, err)
 	})
 }
@@ -417,14 +270,13 @@ func TestSessionTimeout(t *testing.T) {
 
 	t.Run("UpdateSessionTimeout", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		topo.servers["foo"] = nil
 		topo.fsm.Servers = []description.Server{
 			{
-				Addr:                     address.Address("foo").Canonicalize(),
-				Kind:                     description.RSPrimary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("foo").Canonicalize(),
+				Kind:                  description.ServerKindRSPrimary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 		}
 
@@ -432,36 +284,33 @@ func TestSessionTimeout(t *testing.T) {
 		defer cancel()
 
 		desc := description.Server{
-			Addr:                     "foo",
-			Kind:                     description.RSPrimary,
-			SessionTimeoutMinutes:    30,
-			SessionTimeoutMinutesPtr: int64ToPtr(30),
+			Addr:                  "foo",
+			Kind:                  description.ServerKindRSPrimary,
+			SessionTimeoutMinutes: int64ToPtr(30),
 		}
 		topo.apply(ctx, desc)
 
 		currDesc := topo.desc.Load().(description.Topology)
 		want := int64(30)
-		require.Equal(t, &want, currDesc.SessionTimeoutMinutesPtr,
+		require.Equal(t, &want, currDesc.SessionTimeoutMinutes,
 			"session timeout minutes mismatch")
 	})
 	t.Run("MultipleUpdates", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
-		topo.fsm.Kind = description.ReplicaSetWithPrimary
+		require.NoError(t, err)
+		topo.fsm.Kind = description.TopologyKindReplicaSetWithPrimary
 		topo.servers["foo"] = nil
 		topo.servers["bar"] = nil
 		topo.fsm.Servers = []description.Server{
 			{
-				Addr:                     address.Address("foo").Canonicalize(),
-				Kind:                     description.RSPrimary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("foo").Canonicalize(),
+				Kind:                  description.ServerKindRSPrimary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 			{
-				Addr:                     address.Address("bar").Canonicalize(),
-				Kind:                     description.RSSecondary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("bar").Canonicalize(),
+				Kind:                  description.ServerKindRSSecondary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 		}
 
@@ -469,45 +318,41 @@ func TestSessionTimeout(t *testing.T) {
 		defer cancel()
 
 		desc1 := description.Server{
-			Addr:                     "foo",
-			Kind:                     description.RSPrimary,
-			SessionTimeoutMinutes:    30,
-			SessionTimeoutMinutesPtr: int64ToPtr(30),
-			Members:                  []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
+			Addr:                  "foo",
+			Kind:                  description.ServerKindRSPrimary,
+			SessionTimeoutMinutes: int64ToPtr(30),
+			Members:               []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
 		}
 		// should update because new timeout is lower
 		desc2 := description.Server{
-			Addr:                     "bar",
-			Kind:                     description.RSPrimary,
-			SessionTimeoutMinutes:    20,
-			SessionTimeoutMinutesPtr: int64ToPtr(20),
-			Members:                  []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
+			Addr:                  "bar",
+			Kind:                  description.ServerKindRSPrimary,
+			SessionTimeoutMinutes: int64ToPtr(20),
+			Members:               []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
 		}
 		topo.apply(ctx, desc1)
 		topo.apply(ctx, desc2)
 
 		currDesc := topo.Description()
 		want := int64(20)
-		require.Equal(t, &want, currDesc.SessionTimeoutMinutesPtr,
+		require.Equal(t, &want, currDesc.SessionTimeoutMinutes,
 			"session timeout minutes mismatch")
 	})
 	t.Run("NoUpdate", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		topo.servers["foo"] = nil
 		topo.servers["bar"] = nil
 		topo.fsm.Servers = []description.Server{
 			{
-				Addr:                     address.Address("foo").Canonicalize(),
-				Kind:                     description.RSPrimary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("foo").Canonicalize(),
+				Kind:                  description.ServerKindRSPrimary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 			{
-				Addr:                     address.Address("bar").Canonicalize(),
-				Kind:                     description.RSSecondary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("bar").Canonicalize(),
+				Kind:                  description.ServerKindRSSecondary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 		}
 
@@ -515,45 +360,41 @@ func TestSessionTimeout(t *testing.T) {
 		defer cancel()
 
 		desc1 := description.Server{
-			Addr:                     "foo",
-			Kind:                     description.RSPrimary,
-			SessionTimeoutMinutes:    20,
-			SessionTimeoutMinutesPtr: int64ToPtr(20),
-			Members:                  []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
+			Addr:                  "foo",
+			Kind:                  description.ServerKindRSPrimary,
+			SessionTimeoutMinutes: int64ToPtr(20),
+			Members:               []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
 		}
 		// should not update because new timeout is higher
 		desc2 := description.Server{
-			Addr:                     "bar",
-			Kind:                     description.RSPrimary,
-			SessionTimeoutMinutes:    30,
-			SessionTimeoutMinutesPtr: int64ToPtr(30),
-			Members:                  []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
+			Addr:                  "bar",
+			Kind:                  description.ServerKindRSPrimary,
+			SessionTimeoutMinutes: int64ToPtr(30),
+			Members:               []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
 		}
 		topo.apply(ctx, desc1)
 		topo.apply(ctx, desc2)
 
 		currDesc := topo.desc.Load().(description.Topology)
 		want := int64(20)
-		require.Equal(t, &want, currDesc.SessionTimeoutMinutesPtr,
+		require.Equal(t, &want, currDesc.SessionTimeoutMinutes,
 			"session timeout minutes mismatch")
 	})
 	t.Run("TimeoutDataBearing", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
+		require.NoError(t, err)
 		topo.servers["foo"] = nil
 		topo.servers["bar"] = nil
 		topo.fsm.Servers = []description.Server{
 			{
-				Addr:                     address.Address("foo").Canonicalize(),
-				Kind:                     description.RSPrimary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("foo").Canonicalize(),
+				Kind:                  description.ServerKindRSPrimary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 			{
-				Addr:                     address.Address("bar").Canonicalize(),
-				Kind:                     description.RSSecondary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("bar").Canonicalize(),
+				Kind:                  description.ServerKindRSSecondary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 		}
 
@@ -561,52 +402,48 @@ func TestSessionTimeout(t *testing.T) {
 		defer cancel()
 
 		desc1 := description.Server{
-			Addr:                     "foo",
-			Kind:                     description.RSPrimary,
-			SessionTimeoutMinutes:    20,
-			SessionTimeoutMinutesPtr: int64ToPtr(20),
-			Members:                  []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
+			Addr:                  "foo",
+			Kind:                  description.ServerKindRSPrimary,
+			SessionTimeoutMinutes: int64ToPtr(20),
+			Members:               []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
 		}
 		// should not update because not a data bearing server
 		desc2 := description.Server{
-			Addr:                     "bar",
-			Kind:                     description.Unknown,
-			SessionTimeoutMinutes:    10,
-			SessionTimeoutMinutesPtr: int64ToPtr(10),
-			Members:                  []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
+			Addr:                  "bar",
+			Kind:                  description.Unknown,
+			SessionTimeoutMinutes: int64ToPtr(10),
+			Members:               []address.Address{address.Address("foo").Canonicalize(), address.Address("bar").Canonicalize()},
 		}
 		topo.apply(ctx, desc1)
 		topo.apply(ctx, desc2)
 
 		currDesc := topo.desc.Load().(description.Topology)
 		want := int64(20)
-		assert.Equal(t, &want, currDesc.SessionTimeoutMinutesPtr,
+		assert.Equal(t, &want, currDesc.SessionTimeoutMinutes,
 			"session timeout minutes mismatch")
 	})
 	t.Run("MixedSessionSupport", func(t *testing.T) {
 		topo, err := New(nil)
-		noerr(t, err)
-		topo.fsm.Kind = description.ReplicaSetWithPrimary
+		require.NoError(t, err)
+		topo.fsm.Kind = description.TopologyKindReplicaSetWithPrimary
 		topo.servers["one"] = nil
 		topo.servers["two"] = nil
 		topo.servers["three"] = nil
 		topo.fsm.Servers = []description.Server{
 			{
-				Addr:                     address.Address("one").Canonicalize(),
-				Kind:                     description.RSPrimary,
-				SessionTimeoutMinutes:    20,
-				SessionTimeoutMinutesPtr: int64ToPtr(20),
+				Addr:                  address.Address("one").Canonicalize(),
+				Kind:                  description.ServerKindRSPrimary,
+				SessionTimeoutMinutes: int64ToPtr(20),
 			},
 			{
 				// does not support sessions
 				Addr: address.Address("two").Canonicalize(),
-				Kind: description.RSSecondary,
+				Kind: description.ServerKindRSSecondary,
 			},
 			{
-				Addr:                     address.Address("three").Canonicalize(),
-				Kind:                     description.RSPrimary,
-				SessionTimeoutMinutes:    60,
-				SessionTimeoutMinutesPtr: int64ToPtr(60),
+				Addr:                  address.Address("three").Canonicalize(),
+				Kind:                  description.ServerKindRSPrimary,
+				SessionTimeoutMinutes: int64ToPtr(60),
 			},
 		}
 
@@ -614,17 +451,16 @@ func TestSessionTimeout(t *testing.T) {
 		defer cancel()
 
 		desc := description.Server{
-			Addr:                     address.Address("three"),
-			Kind:                     description.RSSecondary,
-			SessionTimeoutMinutes:    30,
-			SessionTimeoutMinutesPtr: int64ToPtr(30),
+			Addr:                  address.Address("three"),
+			Kind:                  description.ServerKindRSSecondary,
+			SessionTimeoutMinutes: int64ToPtr(30),
 		}
 
 		topo.apply(ctx, desc)
 
 		currDesc := topo.desc.Load().(description.Topology)
-		require.Nil(t, currDesc.SessionTimeoutMinutesPtr,
-			"session timeout minutes mismatch. got: %d. expected: nil", currDesc.SessionTimeoutMinutes)
+		require.Nil(t, currDesc.SessionTimeoutMinutes,
+			"session timeout minutes mismatch. expected: nil")
 	})
 }
 
@@ -675,7 +511,11 @@ func TestTopologyConstruction(t *testing.T) {
 			uri             string
 			pollingRequired bool
 		}{
-			{"normal", "mongodb://localhost:27017", false},
+			{
+				name:            "normal",
+				uri:             "mongodb://localhost:27017",
+				pollingRequired: false,
+			},
 		}
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -688,6 +528,245 @@ func TestTopologyConstruction(t *testing.T) {
 				assert.Equal(t, tc.uri, topo.cfg.URI, "expected topology URI to be %v, got %v", tc.uri, topo.cfg.URI)
 				assert.Equal(t, tc.pollingRequired, topo.pollingRequired,
 					"expected topo.pollingRequired to be %v, got %v", tc.pollingRequired, topo.pollingRequired)
+			})
+		}
+	})
+}
+
+type mockLogSink struct {
+	msgs []string
+}
+
+func (s *mockLogSink) Info(_ int, msg string, _ ...interface{}) {
+	s.msgs = append(s.msgs, msg)
+}
+func (*mockLogSink) Error(error, string, ...interface{}) {
+	// Do nothing.
+}
+
+// Note: SRV connection strings are intentionally untested, since initial
+// lookup responses cannot be easily mocked.
+func TestTopologyConstructionLogging(t *testing.T) {
+	const (
+		cosmosDBMsg   = `You appear to be connected to a CosmosDB cluster. For more information regarding feature compatibility and support please visit https://www.mongodb.com/supportability/cosmosdb`
+		documentDBMsg = `You appear to be connected to a DocumentDB cluster. For more information regarding feature compatibility and support please visit https://www.mongodb.com/supportability/documentdb`
+	)
+
+	newLoggerOptionsBldr := func(sink options.LogSink) *options.LoggerOptions {
+		return options.
+			Logger().
+			SetSink(sink).
+			SetComponentLevel(options.LogComponentTopology, options.LogLevelInfo)
+	}
+
+	t.Run("CosmosDB URIs", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name string
+			uri  string
+			msgs []string
+		}{
+			{
+				name: "normal",
+				uri:  "mongodb://a.mongo.cosmos.azure.com:19555/",
+				msgs: []string{cosmosDBMsg},
+			},
+			{
+				name: "multiple hosts",
+				uri:  "mongodb://a.mongo.cosmos.azure.com:1955,b.mongo.cosmos.azure.com:19555/",
+				msgs: []string{cosmosDBMsg},
+			},
+			{
+				name: "case-insensitive matching",
+				uri:  "mongodb://a.MONGO.COSMOS.AZURE.COM:19555/",
+				msgs: []string{},
+			},
+			{
+				name: "Mixing genuine and nongenuine hosts (unlikely in practice)",
+				uri:  "mongodb://a.example.com:27017,b.mongo.cosmos.azure.com:19555/",
+				msgs: []string{cosmosDBMsg},
+			},
+		}
+		for _, tc := range testCases {
+			tc := tc
+
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				sink := &mockLogSink{}
+				cfg, err := NewConfig(options.Client().ApplyURI(tc.uri).SetLoggerOptions(newLoggerOptionsBldr(sink)), nil)
+				require.Nil(t, err, "error constructing topology config: %v", err)
+
+				topo, err := New(cfg)
+				require.Nil(t, err, "topology.New error: %v", err)
+
+				err = topo.Connect()
+				assert.Nil(t, err, "Connect error: %v", err)
+
+				assert.ElementsMatch(t, tc.msgs, sink.msgs, "expected messages to be %v, got %v", tc.msgs, sink.msgs)
+			})
+		}
+	})
+	t.Run("DocumentDB URIs", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name string
+			uri  string
+			msgs []string
+		}{
+			{
+				name: "normal",
+				uri:  "mongodb://a.docdb.amazonaws.com:27017/",
+				msgs: []string{documentDBMsg},
+			},
+			{
+				name: "normal",
+				uri:  "mongodb://a.docdb-elastic.amazonaws.com:27017/",
+				msgs: []string{documentDBMsg},
+			},
+			{
+				name: "multiple hosts",
+				uri:  "mongodb://a.docdb.amazonaws.com:27017,a.docdb-elastic.amazonaws.com:27017/",
+				msgs: []string{documentDBMsg},
+			},
+			{
+				name: "case-insensitive matching",
+				uri:  "mongodb://a.DOCDB.AMAZONAWS.COM:27017/",
+				msgs: []string{},
+			},
+			{
+				name: "case-insensitive matching",
+				uri:  "mongodb://a.DOCDB-ELASTIC.AMAZONAWS.COM:27017/",
+				msgs: []string{},
+			},
+			{
+				name: "Mixing genuine and nongenuine hosts (unlikely in practice)",
+				uri:  "mongodb://a.example.com:27017,b.docdb.amazonaws.com:27017/",
+				msgs: []string{documentDBMsg},
+			},
+			{
+				name: "Mixing genuine and nongenuine hosts (unlikely in practice)",
+				uri:  "mongodb://a.example.com:27017,b.docdb-elastic.amazonaws.com:27017/",
+				msgs: []string{documentDBMsg},
+			},
+		}
+		for _, tc := range testCases {
+			tc := tc
+
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				sink := &mockLogSink{}
+				cfg, err := NewConfig(options.Client().ApplyURI(tc.uri).SetLoggerOptions(newLoggerOptionsBldr(sink)), nil)
+				require.Nil(t, err, "error constructing topology config: %v", err)
+
+				topo, err := New(cfg)
+				require.Nil(t, err, "topology.New error: %v", err)
+
+				err = topo.Connect()
+				assert.Nil(t, err, "Connect error: %v", err)
+
+				assert.ElementsMatch(t, tc.msgs, sink.msgs, "expected messages to be %v, got %v", tc.msgs, sink.msgs)
+			})
+		}
+	})
+	t.Run("Mixing CosmosDB and DocumentDB URIs", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name string
+			uri  string
+			msgs []string
+		}{
+			{
+				name: "Mixing hosts",
+				uri:  "mongodb://a.mongo.cosmos.azure.com:19555,a.docdb.amazonaws.com:27017/",
+				msgs: []string{cosmosDBMsg, documentDBMsg},
+			},
+		}
+		for _, tc := range testCases {
+			tc := tc
+
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				sink := &mockLogSink{}
+				cfg, err := NewConfig(options.Client().ApplyURI(tc.uri).SetLoggerOptions(newLoggerOptionsBldr(sink)), nil)
+				require.Nil(t, err, "error constructing topology config: %v", err)
+
+				topo, err := New(cfg)
+				require.Nil(t, err, "topology.New error: %v", err)
+
+				err = topo.Connect()
+				assert.Nil(t, err, "Connect error: %v", err)
+
+				assert.ElementsMatch(t, tc.msgs, sink.msgs, "expected messages to be %v, got %v", tc.msgs, sink.msgs)
+			})
+		}
+	})
+	t.Run("genuine URIs", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name string
+			uri  string
+			msgs []string
+		}{
+			{
+				name: "normal",
+				uri:  "mongodb://a.example.com:27017/",
+				msgs: []string{},
+			},
+			{
+				name: "socket",
+				uri:  "mongodb://%2Ftmp%2Fmongodb-27017.sock/",
+				msgs: []string{},
+			},
+			{
+				name: "srv",
+				uri:  "mongodb+srv://test22.test.build.10gen.cc/?srvServiceName=customname",
+				msgs: []string{},
+			},
+			{
+				name: "multiple hosts",
+				uri:  "mongodb://a.example.com:27017,b.example.com:27017/",
+				msgs: []string{},
+			},
+			{
+				name: "unexpected suffix",
+				uri:  "mongodb://a.mongo.cosmos.azure.com.tld:19555/",
+				msgs: []string{},
+			},
+			{
+				name: "unexpected suffix",
+				uri:  "mongodb://a.docdb.amazonaws.com.tld:27017/",
+				msgs: []string{},
+			},
+			{
+				name: "unexpected suffix",
+				uri:  "mongodb://a.docdb-elastic.amazonaws.com.tld:27017/",
+				msgs: []string{},
+			},
+		}
+		for _, tc := range testCases {
+			tc := tc
+
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				sink := &mockLogSink{}
+				cfg, err := NewConfig(options.Client().ApplyURI(tc.uri).SetLoggerOptions(newLoggerOptionsBldr(sink)), nil)
+				require.Nil(t, err, "error constructing topology config: %v", err)
+
+				topo, err := New(cfg)
+				require.Nil(t, err, "topology.New error: %v", err)
+
+				err = topo.Connect()
+				assert.Nil(t, err, "Connect error: %v", err)
+
+				assert.ElementsMatch(t, tc.msgs, sink.msgs, "expected messages to be %v, got %v", tc.msgs, sink.msgs)
 			})
 		}
 	})
@@ -755,7 +834,8 @@ func runInWindowTest(t *testing.T, directory string, filename string) {
 	for _, testDesc := range test.TopologyDescription.Servers {
 		server := NewServer(
 			address.Address(testDesc.Address),
-			primitive.NilObjectID,
+			bson.NilObjectID,
+			defaultConnectionTimeout,
 			withMonitoringDisabled(func(bool) bool { return true }))
 		servers[testDesc.Address] = server
 
@@ -800,7 +880,7 @@ func runInWindowTest(t *testing.T, directory string, filename string) {
 	for i := 0; i < test.Iterations; i++ {
 		selected, err := topology.SelectServer(
 			context.Background(),
-			description.ReadPrefSelector(readpref.Nearest()))
+			&serverselector.ReadPref{ReadPref: readpref.Nearest()})
 		require.NoError(t, err, "error selecting server")
 		counts[string(selected.(*SelectedServer).address)]++
 	}
@@ -847,17 +927,17 @@ func topologyKindFromString(t *testing.T, s string) description.TopologyKind {
 
 	switch s {
 	case "Single":
-		return description.Single
+		return description.TopologyKindSingle
 	case "ReplicaSet":
-		return description.ReplicaSet
+		return description.TopologyKindReplicaSet
 	case "ReplicaSetNoPrimary":
-		return description.ReplicaSetNoPrimary
+		return description.TopologyKindReplicaSetNoPrimary
 	case "ReplicaSetWithPrimary":
-		return description.ReplicaSetWithPrimary
+		return description.TopologyKindReplicaSetWithPrimary
 	case "Sharded":
-		return description.Sharded
+		return description.TopologyKindSharded
 	case "LoadBalanced":
-		return description.LoadBalanced
+		return description.TopologyKindLoadBalanced
 	case "Unknown":
 		return description.Unknown
 	default:
@@ -872,21 +952,21 @@ func serverKindFromString(t *testing.T, s string) description.ServerKind {
 
 	switch s {
 	case "Standalone":
-		return description.Standalone
+		return description.ServerKindStandalone
 	case "RSOther":
-		return description.RSMember
+		return description.ServerKindRSMember
 	case "RSPrimary":
-		return description.RSPrimary
+		return description.ServerKindRSPrimary
 	case "RSSecondary":
-		return description.RSSecondary
+		return description.ServerKindRSSecondary
 	case "RSArbiter":
-		return description.RSArbiter
+		return description.ServerKindRSArbiter
 	case "RSGhost":
-		return description.RSGhost
+		return description.ServerKindRSGhost
 	case "Mongos":
-		return description.Mongos
+		return description.ServerKindMongos
 	case "LoadBalancer":
-		return description.LoadBalancer
+		return description.ServerKindLoadBalancer
 	case "PossiblePrimary", "Unknown":
 		// Go does not have a PossiblePrimary server type and per the SDAM spec, this type is synonymous with Unknown.
 		return description.Unknown
@@ -904,7 +984,7 @@ func BenchmarkSelectServerFromDescription(b *testing.B) {
 	}{
 		{
 			name:        "AllFit",
-			serversHook: func(servers []description.Server) {},
+			serversHook: func([]description.Server) {},
 		},
 		{
 			name: "AllButOneFit",
@@ -937,7 +1017,7 @@ func BenchmarkSelectServerFromDescription(b *testing.B) {
 				HeartbeatInterval: time.Duration(10) * time.Second,
 				LastWriteTime:     time.Date(2017, 2, 11, 14, 0, 0, 0, time.UTC),
 				LastUpdateTime:    time.Date(2017, 2, 11, 14, 0, 2, 0, time.UTC),
-				Kind:              description.Mongos,
+				Kind:              description.ServerKindMongos,
 				WireVersion:       &description.VersionRange{Min: 6, Max: 21},
 			}
 			servers := make([]description.Server, 100)
@@ -949,13 +1029,12 @@ func BenchmarkSelectServerFromDescription(b *testing.B) {
 				Servers: servers,
 			}
 
-			timeout := make(chan time.Time)
 			b.ResetTimer()
 			b.RunParallel(func(p *testing.PB) {
 				b.ReportAllocs()
 				for p.Next() {
 					var c Topology
-					_, _ = c.selectServerFromDescription(desc, newServerSelectionState(selectNone, timeout))
+					_, _ = c.selectServerFromDescription(desc, selectNone)
 				}
 			})
 		})

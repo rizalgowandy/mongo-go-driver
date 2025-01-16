@@ -7,10 +7,8 @@
 package bson
 
 import (
+	"bytes"
 	"reflect"
-
-	"go.mongodb.org/mongo-driver/bson/bsonrw"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
 type unmarshalingTestCase struct {
@@ -199,11 +197,30 @@ type unmarshalerNonPtrStruct struct {
 
 type myInt64 int64
 
-func (mi *myInt64) UnmarshalBSON(bytes []byte) error {
-	if len(bytes) == 0 {
+var _ ValueUnmarshaler = (*myInt64)(nil)
+
+func (mi *myInt64) UnmarshalBSONValue(t byte, b []byte) error {
+	if len(b) == 0 {
 		return nil
 	}
-	i, err := bsonrw.NewBSONValueReader(bsontype.Int64, bytes).ReadInt64()
+
+	if Type(t) == TypeInt64 {
+		i, err := newValueReader(TypeInt64, bytes.NewReader(b)).ReadInt64()
+		if err != nil {
+			return err
+		}
+
+		*mi = myInt64(i)
+	}
+
+	return nil
+}
+
+func (mi *myInt64) UnmarshalBSON(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	i, err := newValueReader(TypeInt64, bytes.NewReader(b)).ReadInt64()
 	if err != nil {
 		return err
 	}
@@ -225,11 +242,11 @@ func (mm *myMap) UnmarshalBSON(bytes []byte) error {
 
 type myBytes []byte
 
-func (mb *myBytes) UnmarshalBSON(bytes []byte) error {
-	if len(bytes) == 0 {
+func (mb *myBytes) UnmarshalBSON(b []byte) error {
+	if len(b) == 0 {
 		return nil
 	}
-	b, _, err := bsonrw.NewBSONValueReader(bsontype.Binary, bytes).ReadBinary()
+	b, _, err := newValueReader(TypeBinary, bytes.NewReader(b)).ReadBinary()
 	if err != nil {
 		return err
 	}
@@ -239,11 +256,11 @@ func (mb *myBytes) UnmarshalBSON(bytes []byte) error {
 
 type myString string
 
-func (ms *myString) UnmarshalBSON(bytes []byte) error {
-	if len(bytes) == 0 {
+func (ms *myString) UnmarshalBSON(b []byte) error {
+	if len(b) == 0 {
 		return nil
 	}
-	s, err := bsonrw.NewBSONValueReader(bsontype.String, bytes).ReadString()
+	s, err := newValueReader(TypeString, bytes.NewReader(b)).ReadString()
 	if err != nil {
 		return err
 	}

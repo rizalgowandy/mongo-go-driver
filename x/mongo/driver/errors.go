@@ -13,9 +13,10 @@ import (
 	"fmt"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
 )
 
 // LegacyNotPrimaryErrMsg is the error message that older MongoDB servers (see
@@ -24,7 +25,22 @@ import (
 const LegacyNotPrimaryErrMsg = "not master"
 
 var (
-	retryableCodes          = []int32{11600, 11602, 10107, 13435, 13436, 189, 91, 7, 6, 89, 9001, 262}
+	retryableCodes = []int32{
+		6,     // HostUnreachable
+		7,     // HostNotFound
+		89,    // NetworkTimeout
+		91,    // ShutdownInProgress
+		134,   // ReadConcernMajorityNotAvailableYet
+		189,   // PrimarySteppedDown
+		262,   // ExceededTimeLimit
+		9001,  // SocketException
+		10107, // NotWritablePrimary
+		11600, // InterruptedAtShutdown
+		11602, // InterruptedDueToReplStateChange
+		13435, // NotPrimaryNoSecondaryOk
+		13436, // NotPrimaryOrSecondary
+	}
+
 	nodeIsRecoveringCodes   = []int32{11600, 11602, 13436, 189, 91}
 	notPrimaryCodes         = []int32{10107, 13435, 10058}
 	nodeIsShuttingDownCodes = []int32{11600, 91}
@@ -40,7 +56,7 @@ var (
 	TransientTransactionError = "TransientTransactionError"
 	// NetworkError is an error label for network errors.
 	NetworkError = "NetworkError"
-	// RetryableWriteError is an error lable for retryable write errors.
+	// RetryableWriteError is an error label for retryable write errors.
 	RetryableWriteError = "RetryableWriteError"
 	// NoWritesPerformed is an error label indicated that no writes were performed for an operation.
 	NoWritesPerformed = "NoWritesPerformed"
@@ -58,8 +74,6 @@ var (
 	ErrDeadlineWouldBeExceeded = fmt.Errorf(
 		"operation not sent to server, as Timeout would be exceeded: %w",
 		context.DeadlineExceeded)
-	// ErrNegativeMaxTime is returned when MaxTime on an operation is a negative value.
-	ErrNegativeMaxTime = errors.New("a negative value was provided for MaxTime on an operation")
 )
 
 // QueryFailureError is an error representing a command failure as a document.
@@ -126,7 +140,7 @@ func (wce WriteCommandError) Error() string {
 }
 
 // Retryable returns true if the error is retryable
-func (wce WriteCommandError) Retryable(wireVersion *description.VersionRange) bool {
+func (wce WriteCommandError) Retryable(serverKind description.ServerKind, wireVersion *description.VersionRange) bool {
 	for _, label := range wce.Labels {
 		if label == RetryableWriteError {
 			return true
@@ -139,16 +153,14 @@ func (wce WriteCommandError) Retryable(wireVersion *description.VersionRange) bo
 	if wce.WriteConcernError == nil {
 		return false
 	}
-	return (*wce.WriteConcernError).Retryable()
+	return wce.WriteConcernError.Retryable(serverKind, wireVersion)
 }
 
 // HasErrorLabel returns true if the error contains the specified label.
 func (wce WriteCommandError) HasErrorLabel(label string) bool {
-	if wce.Labels != nil {
-		for _, l := range wce.Labels {
-			if l == label {
-				return true
-			}
+	for _, l := range wce.Labels {
+		if l == label {
+			return true
 		}
 	}
 	return false
@@ -174,7 +186,14 @@ func (wce WriteConcernError) Error() string {
 }
 
 // Retryable returns true if the error is retryable
-func (wce WriteConcernError) Retryable() bool {
+func (wce WriteConcernError) Retryable(serverKind description.ServerKind, wireVersion *description.VersionRange) bool {
+	if serverKind == description.ServerKindMongos && wireVersion.Max < 9 {
+		// For a pre-4.4 mongos response, we can trust that mongos will have already
+		// retried the operation if necessary. Drivers should not retry to avoid
+		// "excessive retrying".
+		return false
+	}
+
 	for _, code := range retryableCodes {
 		if wce.Code == int64(code) {
 			return true
@@ -264,10 +283,15 @@ func (e Error) UnsupportedStorageEngine() bool {
 
 // Error implements the error interface.
 func (e Error) Error() string {
+	var msg string
 	if e.Name != "" {
-		return fmt.Sprintf("(%v) %v", e.Name, e.Message)
+		msg = fmt.Sprintf("(%v)", e.Name)
 	}
-	return e.Message
+	msg += " " + e.Message
+	if e.Wrapped != nil {
+		msg += ": " + e.Wrapped.Error()
+	}
+	return msg
 }
 
 // Unwrap returns the underlying error.
@@ -277,11 +301,9 @@ func (e Error) Unwrap() error {
 
 // HasErrorLabel returns true if the error contains the specified label.
 func (e Error) HasErrorLabel(label string) bool {
-	if e.Labels != nil {
-		for _, l := range e.Labels {
-			if l == label {
-				return true
-			}
+	for _, l := range e.Labels {
+		if l == label {
+			return true
 		}
 	}
 	return false
@@ -388,19 +410,19 @@ func ExtractErrorFromServerResponse(doc bsoncore.Document) error {
 		switch elem.Key() {
 		case "ok":
 			switch elem.Value().Type {
-			case bson.TypeInt32:
+			case bsoncore.TypeInt32:
 				if elem.Value().Int32() == 1 {
 					ok = true
 				}
-			case bson.TypeInt64:
+			case bsoncore.TypeInt64:
 				if elem.Value().Int64() == 1 {
 					ok = true
 				}
-			case bson.TypeDouble:
+			case bsoncore.TypeDouble:
 				if elem.Value().Double() == 1 {
 					ok = true
 				}
-			case bson.TypeBoolean:
+			case bsoncore.TypeBoolean:
 				if elem.Value().Boolean() {
 					ok = true
 				}
@@ -497,7 +519,7 @@ func ExtractErrorFromServerResponse(doc bsoncore.Document) error {
 			if !ok {
 				break
 			}
-			version, err := description.NewTopologyVersion(bson.Raw(doc))
+			version, err := driverutil.NewTopologyVersion(bson.Raw(doc))
 			if err == nil {
 				tv = version
 			}
@@ -509,7 +531,7 @@ func ExtractErrorFromServerResponse(doc bsoncore.Document) error {
 			errmsg = "command failed"
 		}
 
-		return Error{
+		err := Error{
 			Code:            code,
 			Message:         errmsg,
 			Name:            codeName,
@@ -517,6 +539,20 @@ func ExtractErrorFromServerResponse(doc bsoncore.Document) error {
 			TopologyVersion: tv,
 			Raw:             doc,
 		}
+
+		// If we get a MaxTimeMSExpired error, assume that the error was caused
+		// by setting "maxTimeMS" on the command based on the context deadline
+		// or on "timeoutMS". In that case, make the error wrap
+		// context.DeadlineExceeded so that users can always check
+		//
+		//  errors.Is(err, context.DeadlineExceeded)
+		//
+		// for either client-side or server-side timeouts.
+		if err.Code == 50 {
+			err.Wrapped = context.DeadlineExceeded
+		}
+
+		return err
 	}
 
 	if len(wcError.WriteErrors) > 0 || wcError.WriteConcernError != nil {

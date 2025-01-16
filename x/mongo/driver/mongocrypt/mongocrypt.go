@@ -22,11 +22,11 @@ import (
 	"net/http"
 	"unsafe"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/internal/httputil"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/auth/creds"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/mongocrypt/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/internal/httputil"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/auth/creds"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/mongocrypt/options"
 )
 
 type kmsProvider interface {
@@ -278,7 +278,12 @@ func (m *MongoCrypt) createExplicitEncryptionContext(opts *options.ExplicitEncry
 		if opts.RangeOptions.Precision != nil {
 			mongocryptDoc = bsoncore.AppendInt32Element(mongocryptDoc, "precision", *opts.RangeOptions.Precision)
 		}
-		mongocryptDoc = bsoncore.AppendInt64Element(mongocryptDoc, "sparsity", opts.RangeOptions.Sparsity)
+		if opts.RangeOptions.Sparsity != nil {
+			mongocryptDoc = bsoncore.AppendInt64Element(mongocryptDoc, "sparsity", *opts.RangeOptions.Sparsity)
+		}
+		if opts.RangeOptions.TrimFactor != nil {
+			mongocryptDoc = bsoncore.AppendInt32Element(mongocryptDoc, "trimFactor", *opts.RangeOptions.TrimFactor)
+		}
 
 		mongocryptDoc, err := bsoncore.AppendDocumentEnd(mongocryptDoc, idx)
 		if err != nil {

@@ -22,9 +22,9 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/internal/aws"
-	"go.mongodb.org/mongo-driver/internal/aws/credentials"
-	"go.mongodb.org/mongo-driver/internal/credproviders"
+	"go.mongodb.org/mongo-driver/v2/internal/aws"
+	"go.mongodb.org/mongo-driver/v2/internal/aws/credentials"
+	"go.mongodb.org/mongo-driver/v2/internal/credproviders"
 )
 
 func epochTime() time.Time { return time.Unix(0, 0) }
@@ -305,7 +305,7 @@ func TestSignWithBody_ReplaceRequestBody(t *testing.T) {
 	}
 
 	if req.Body == origBody {
-		t.Errorf("expeect request body to not be origBody")
+		t.Errorf("expect request body to not be origBody")
 	}
 
 	if req.Body == nil {

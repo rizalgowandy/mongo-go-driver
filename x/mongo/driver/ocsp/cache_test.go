@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/v2/internal/assert"
 	"golang.org/x/crypto/ocsp"
 )
 
@@ -34,8 +34,8 @@ func TestCache(t *testing.T) {
 		err := Verify(ctx, tls.ConnectionState{}, &VerifyOptions{})
 		assert.NotNil(t, err, "expected error, got nil")
 
-		ocspErr, ok := err.(*Error)
-		assert.True(t, ok, "expected error of type %T, got %v of type %T", &Error{}, err, err)
+		var ocspErr *Error
+		assert.True(t, errors.As(err, &ocspErr), "expected error of type %T, got %v of type %T", &Error{}, err, err)
 		expected := &Error{
 			wrapped: errors.New("no OCSP cache provided"),
 		}

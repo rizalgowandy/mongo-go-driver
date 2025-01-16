@@ -9,7 +9,7 @@ package driver
 import (
 	"errors"
 
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 )
 
 // ErrDocumentTooLarge occurs when a document that is larger than the maximum size accepted by a
@@ -17,7 +17,7 @@ import (
 var ErrDocumentTooLarge = errors.New("an inserted document is too large")
 
 // Batches contains the necessary information to batch split an operation. This is only used for write
-// oeprations.
+// operations.
 type Batches struct {
 	Identifier string
 	Documents  []bsoncore.Document

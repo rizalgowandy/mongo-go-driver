@@ -14,8 +14,8 @@ import (
 	"log"
 	"sync"
 
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type CustomLogger struct {
@@ -53,20 +53,20 @@ func ExampleClientOptions_SetLoggerOptions_customLogger() {
 		ApplyURI("mongodb://localhost:27017").
 		SetLoggerOptions(loggerOptions)
 
-	client, err := mongo.Connect(context.TODO(), clientOptions)
+	client, err := mongo.Connect(clientOptions)
 
 	if err != nil {
-		log.Fatalf("error connecting to MongoDB: %v", err)
+		log.Panicf("error connecting to MongoDB: %v", err)
 	}
 
-	defer client.Disconnect(context.TODO())
+	defer func() { _ = client.Disconnect(context.TODO()) }()
 
 	// Make a database request to test our logging solution.
 	coll := client.Database("test").Collection("test")
 
 	_, err = coll.InsertOne(context.TODO(), map[string]string{"foo": "bar"})
 	if err != nil {
-		log.Fatalf("InsertOne failed: %v", err)
+		log.Panicf("InsertOne failed: %v", err)
 	}
 
 	// Print the logs.

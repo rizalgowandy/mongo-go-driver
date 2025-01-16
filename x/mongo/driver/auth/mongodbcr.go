@@ -10,16 +10,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 
 	// Ignore gosec warning "Blocklisted import crypto/md5: weak cryptographic primitive". We need
 	// to use MD5 here to implement the MONGODB-CR specification.
 	/* #nosec G501 */
 	"crypto/md5"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/operation"
 )
 
 // MONGODBCR is the mechanism name for MONGODB-CR.
@@ -28,9 +29,13 @@ import (
 // MongoDB 4.0.
 const MONGODBCR = "MONGODB-CR"
 
-func newMongoDBCRAuthenticator(cred *Cred) (Authenticator, error) {
+func newMongoDBCRAuthenticator(cred *Cred, _ *http.Client) (Authenticator, error) {
+	source := cred.Source
+	if source == "" {
+		source = "admin"
+	}
 	return &MongoDBCRAuthenticator{
-		DB:       cred.Source,
+		DB:       source,
 		Username: cred.Username,
 		Password: cred.Password,
 	}, nil
@@ -50,7 +55,7 @@ type MongoDBCRAuthenticator struct {
 //
 // The MONGODB-CR authentication mechanism is deprecated in MongoDB 3.6 and removed in
 // MongoDB 4.0.
-func (a *MongoDBCRAuthenticator) Auth(ctx context.Context, cfg *Config) error {
+func (a *MongoDBCRAuthenticator) Auth(ctx context.Context, cfg *driver.AuthConfig) error {
 
 	db := a.DB
 	if db == "" {
@@ -60,7 +65,7 @@ func (a *MongoDBCRAuthenticator) Auth(ctx context.Context, cfg *Config) error {
 	doc := bsoncore.BuildDocumentFromElements(nil, bsoncore.AppendInt32Element(nil, "getnonce", 1))
 	cmd := operation.NewCommand(doc).
 		Database(db).
-		Deployment(driver.SingleConnectionDeployment{cfg.Connection}).
+		Deployment(driver.SingleConnectionDeployment{C: cfg.Connection}).
 		ClusterClock(cfg.ClusterClock).
 		ServerAPI(cfg.ServerAPI)
 	err := cmd.Execute(ctx)
@@ -86,7 +91,7 @@ func (a *MongoDBCRAuthenticator) Auth(ctx context.Context, cfg *Config) error {
 	)
 	cmd = operation.NewCommand(doc).
 		Database(db).
-		Deployment(driver.SingleConnectionDeployment{cfg.Connection}).
+		Deployment(driver.SingleConnectionDeployment{C: cfg.Connection}).
 		ClusterClock(cfg.ClusterClock).
 		ServerAPI(cfg.ServerAPI)
 	err = cmd.Execute(ctx)
@@ -95,6 +100,11 @@ func (a *MongoDBCRAuthenticator) Auth(ctx context.Context, cfg *Config) error {
 	}
 
 	return nil
+}
+
+// Reauth reauthenticates the connection.
+func (a *MongoDBCRAuthenticator) Reauth(_ context.Context, _ *driver.AuthConfig) error {
+	return newAuthError("MONGODB-CR does not support reauthentication", nil)
 }
 
 func (a *MongoDBCRAuthenticator) createKey(nonce string) string {
