@@ -9,28 +9,29 @@ package topology
 import (
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsoncodec"
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/logger"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/logger"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
-var defaultRegistry = bson.NewRegistryBuilder().Build()
+var defaultRegistry = bson.NewRegistry()
 
 type serverConfig struct {
-	clock              *session.ClusterClock
-	compressionOpts    []string
-	connectionOpts     []ConnectionOption
-	appname            string
-	heartbeatInterval  time.Duration
-	heartbeatTimeout   time.Duration
-	serverMonitor      *event.ServerMonitor
-	registry           *bsoncodec.Registry
-	monitoringDisabled bool
-	serverAPI          *driver.ServerAPIOptions
-	loadBalanced       bool
+	clock                *session.ClusterClock
+	compressionOpts      []string
+	connectionOpts       []ConnectionOption
+	appname              string
+	heartbeatInterval    time.Duration
+	connectTimeout       time.Duration
+	serverMonitoringMode string
+	serverMonitor        *event.ServerMonitor
+	registry             *bson.Registry
+	monitoringDisabled   bool
+	serverAPI            *driver.ServerAPIOptions
+	loadBalanced         bool
 
 	// Connection pool options.
 	maxConns             uint64
@@ -40,12 +41,17 @@ type serverConfig struct {
 	logger               *logger.Logger
 	poolMaxIdleTime      time.Duration
 	poolMaintainInterval time.Duration
+
+	// Fields provided by a library that wraps the Go Driver.
+	outerLibraryName     string
+	outerLibraryVersion  string
+	outerLibraryPlatform string
 }
 
-func newServerConfig(opts ...ServerOption) *serverConfig {
+func newServerConfig(connectTimeout time.Duration, opts ...ServerOption) *serverConfig {
 	cfg := &serverConfig{
 		heartbeatInterval: 10 * time.Second,
-		heartbeatTimeout:  10 * time.Second,
+		connectTimeout:    connectTimeout,
 		registry:          defaultRegistry,
 	}
 
@@ -64,8 +70,8 @@ type ServerOption func(*serverConfig)
 
 // ServerAPIFromServerOptions will return the server API options if they have been functionally set on the ServerOption
 // slice.
-func ServerAPIFromServerOptions(opts []ServerOption) *driver.ServerAPIOptions {
-	return newServerConfig(opts...).serverAPI
+func ServerAPIFromServerOptions(connectTimeout time.Duration, opts []ServerOption) *driver.ServerAPIOptions {
+	return newServerConfig(connectTimeout, opts...).serverAPI
 }
 
 func withMonitoringDisabled(fn func(bool) bool) ServerOption {
@@ -95,18 +101,34 @@ func WithServerAppName(fn func(string) string) ServerOption {
 	}
 }
 
+// WithOuterLibraryName configures the name for the outer library to include
+// in the drivers section of the handshake metadata.
+func WithOuterLibraryName(fn func(string) string) ServerOption {
+	return func(cfg *serverConfig) {
+		cfg.outerLibraryName = fn(cfg.outerLibraryName)
+	}
+}
+
+// WithOuterLibraryVersion configures the version for the outer library to
+// include in the drivers section of the handshake metadata.
+func WithOuterLibraryVersion(fn func(string) string) ServerOption {
+	return func(cfg *serverConfig) {
+		cfg.outerLibraryVersion = fn(cfg.outerLibraryVersion)
+	}
+}
+
+// WithOuterLibraryPlatform configures the platform for the outer library to
+// include in the platform section of the handshake metadata.
+func WithOuterLibraryPlatform(fn func(string) string) ServerOption {
+	return func(cfg *serverConfig) {
+		cfg.outerLibraryPlatform = fn(cfg.outerLibraryPlatform)
+	}
+}
+
 // WithHeartbeatInterval configures a server's heartbeat interval.
 func WithHeartbeatInterval(fn func(time.Duration) time.Duration) ServerOption {
 	return func(cfg *serverConfig) {
 		cfg.heartbeatInterval = fn(cfg.heartbeatInterval)
-	}
-}
-
-// WithHeartbeatTimeout configures how long to wait for a heartbeat socket to
-// connection.
-func WithHeartbeatTimeout(fn func(time.Duration) time.Duration) ServerOption {
-	return func(cfg *serverConfig) {
-		cfg.heartbeatTimeout = fn(cfg.heartbeatTimeout)
 	}
 }
 
@@ -176,7 +198,7 @@ func WithClock(fn func(clock *session.ClusterClock) *session.ClusterClock) Serve
 
 // WithRegistry configures the registry for the server to use when creating
 // cursors.
-func WithRegistry(fn func(*bsoncodec.Registry) *bsoncodec.Registry) ServerOption {
+func WithRegistry(fn func(*bson.Registry) *bson.Registry) ServerOption {
 	return func(cfg *serverConfig) {
 		cfg.registry = fn(cfg.registry)
 	}
@@ -200,5 +222,19 @@ func WithServerLoadBalanced(fn func(bool) bool) ServerOption {
 func withLogger(fn func() *logger.Logger) ServerOption {
 	return func(cfg *serverConfig) {
 		cfg.logger = fn()
+	}
+}
+
+// withServerMonitoringMode configures the mode (stream, poll, or auto) to use
+// for monitoring.
+func withServerMonitoringMode(mode *string) ServerOption {
+	return func(cfg *serverConfig) {
+		if mode != nil {
+			cfg.serverMonitoringMode = *mode
+
+			return
+		}
+
+		cfg.serverMonitoringMode = connstring.ServerMonitoringModeAuto
 	}
 }

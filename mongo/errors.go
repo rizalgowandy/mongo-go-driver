@@ -14,15 +14,12 @@ import (
 	"net"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/internal/codecutil"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/mongocrypt"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/internal/codecutil"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/mongocrypt"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 )
-
-// ErrUnacknowledgedWrite is returned by operations that have an unacknowledged write concern.
-var ErrUnacknowledgedWrite = errors.New("unacknowledged write")
 
 // ErrClientDisconnected is returned when disconnected Client is used to run an operation.
 var ErrClientDisconnected = errors.New("client is disconnected")
@@ -35,6 +32,9 @@ var ErrNilValue = errors.New("value is nil")
 
 // ErrEmptySlice is returned when an empty slice is passed to a CRUD method that requires a non-empty slice.
 var ErrEmptySlice = errors.New("must provide at least one element in input slice")
+
+// ErrNotSlice is returned when a type other than slice is passed to InsertMany.
+var ErrNotSlice = errors.New("must provide a non-empty slice")
 
 // ErrMapForOrderedArgument is returned when a map with multiple keys is passed to a CRUD method for an ordered parameter
 type ErrMapForOrderedArgument struct {
@@ -52,7 +52,16 @@ func replaceErrors(err error) error {
 		return nil
 	}
 
-	if err == topology.ErrTopologyClosed {
+	// Do not propagate the acknowledgement sentinel error. For DDL commands,
+	// (creating indexes, dropping collections, etc) acknowledgement should be
+	// ignored. For non-DDL write commands (insert, update, etc), acknowledgement
+	// should be be propagated at the result-level: e.g.,
+	// SingleResult.Acknowledged.
+	if err == driver.ErrUnacknowledgedWrite {
+		return nil
+	}
+
+	if errors.Is(err, topology.ErrTopologyClosed) {
 		return ErrClientDisconnected
 	}
 	if de, ok := err.(driver.Error); ok {
@@ -102,49 +111,55 @@ func replaceErrors(err error) error {
 	return err
 }
 
-// IsDuplicateKeyError returns true if err is a duplicate key error
+// IsDuplicateKeyError returns true if err is a duplicate key error. For BulkWriteExceptions,
+// IsDuplicateKeyError returns true if at least one of the errors is a duplicate key error.
 func IsDuplicateKeyError(err error) bool {
-	// handles SERVER-7164 and SERVER-11493
-	for ; err != nil; err = unwrap(err) {
-		if e, ok := err.(ServerError); ok {
-			return e.HasErrorCode(11000) || e.HasErrorCode(11001) || e.HasErrorCode(12582) ||
-				e.HasErrorCodeWithMessage(16460, " E11000 ")
-		}
+	if se := ServerError(nil); errors.As(err, &se) {
+		return se.HasErrorCode(11000) || // Duplicate key error.
+			se.HasErrorCode(11001) || // Duplicate key error on update.
+			// Duplicate key error in a capped collection. See SERVER-7164.
+			se.HasErrorCode(12582) ||
+			// Mongos insert error caused by a duplicate key error. See
+			// SERVER-11493.
+			se.HasErrorCodeWithMessage(16460, " E11000 ")
 	}
 	return false
 }
 
-// IsTimeout returns true if err is from a timeout
+// timeoutErrs is a list of error values that indicate a timeout happened.
+var timeoutErrs = [...]error{
+	context.DeadlineExceeded,
+	driver.ErrDeadlineWouldBeExceeded,
+}
+
+// IsTimeout returns true if err was caused by a timeout. For error chains,
+// IsTimeout returns true if any error in the chain was caused by a timeout.
 func IsTimeout(err error) bool {
-	for ; err != nil; err = unwrap(err) {
-		// check unwrappable errors together
-		if err == context.DeadlineExceeded {
+	// Check if the error chain contains any of the timeout error values.
+	for _, target := range timeoutErrs {
+		if errors.Is(err, target) {
 			return true
 		}
-		if err == driver.ErrDeadlineWouldBeExceeded {
+	}
+
+	// Check if the error chain contains any error types that can indicate
+	// timeout.
+	if errors.As(err, &topology.WaitQueueTimeoutError{}) {
+		return true
+	}
+	if ce := (CommandError{}); errors.As(err, &ce) && ce.IsMaxTimeMSExpiredError() {
+		return true
+	}
+	if we := (WriteException{}); errors.As(err, &we) && we.WriteConcernError != nil && we.WriteConcernError.IsMaxTimeMSExpiredError() {
+		return true
+	}
+	if ne := net.Error(nil); errors.As(err, &ne) {
+		return ne.Timeout()
+	}
+	// Check timeout error labels.
+	if le := LabeledError(nil); errors.As(err, &le) {
+		if le.HasErrorLabel("NetworkTimeoutError") || le.HasErrorLabel("ExceededTimeLimitError") {
 			return true
-		}
-		if err == topology.ErrServerSelectionTimeout {
-			return true
-		}
-		if _, ok := err.(topology.WaitQueueTimeoutError); ok {
-			return true
-		}
-		if ce, ok := err.(CommandError); ok && ce.IsMaxTimeMSExpiredError() {
-			return true
-		}
-		if we, ok := err.(WriteException); ok && we.WriteConcernError != nil &&
-			we.WriteConcernError.IsMaxTimeMSExpiredError() {
-			return true
-		}
-		if ne, ok := err.(net.Error); ok {
-			return ne.Timeout()
-		}
-		//timeout error labels
-		if le, ok := err.(LabeledError); ok {
-			if le.HasErrorLabel("NetworkTimeoutError") || le.HasErrorLabel("ExceededTimeLimitError") {
-				return true
-			}
 		}
 	}
 
@@ -177,7 +192,7 @@ func IsNetworkError(err error) bool {
 	return errorHasLabel(err, "NetworkError")
 }
 
-// MongocryptError represents an libmongocrypt error during client-side encryption.
+// MongocryptError represents an libmongocrypt error during in-use encryption.
 type MongocryptError struct {
 	Code    int32
 	Message string
@@ -188,7 +203,7 @@ func (m MongocryptError) Error() string {
 	return fmt.Sprintf("mongocrypt error %d: %v", m.Code, m.Message)
 }
 
-// EncryptionKeyVaultError represents an error while communicating with the key vault collection during client-side
+// EncryptionKeyVaultError represents an error while communicating with the key vault collection during in-use
 // encryption.
 type EncryptionKeyVaultError struct {
 	Wrapped error
@@ -204,7 +219,7 @@ func (ekve EncryptionKeyVaultError) Unwrap() error {
 	return ekve.Wrapped
 }
 
-// MongocryptdError represents an error while communicating with mongocryptd during client-side encryption.
+// MongocryptdError represents an error while communicating with mongocryptd during in-use encryption.
 type MongocryptdError struct {
 	Wrapped error
 }
@@ -237,13 +252,31 @@ type ServerError interface {
 	// HasErrorCodeWithMessage returns true if any of the contained errors have the specified code and message.
 	HasErrorCodeWithMessage(int, string) bool
 
+	// ErrorCodes returns all error codes (unsorted) in the server’s response.
+	// This would include nested errors (e.g., write concern errors) for
+	// supporting implementations (e.g., BulkWriteException) as well as the
+	// top-level error code.
+	ErrorCodes() []int
+
 	serverError()
+}
+
+func hasErrorCode(srvErr ServerError, code int) bool {
+	for _, srvErrCode := range srvErr.ErrorCodes() {
+		if code == srvErrCode {
+			return true
+		}
+	}
+
+	return false
 }
 
 var _ ServerError = CommandError{}
 var _ ServerError = WriteError{}
 var _ ServerError = WriteException{}
 var _ ServerError = BulkWriteException{}
+
+var _ error = ClientBulkWriteException{}
 
 // CommandError represents a server error during execution of a command. This can be returned by any operation.
 type CommandError struct {
@@ -273,13 +306,16 @@ func (e CommandError) HasErrorCode(code int) bool {
 	return int(e.Code) == code
 }
 
+// ErrorCodes returns a list of error codes returned by the server.
+func (e CommandError) ErrorCodes() []int {
+	return []int{int(e.Code)}
+}
+
 // HasErrorLabel returns true if the error contains the specified label.
 func (e CommandError) HasErrorLabel(label string) bool {
-	if e.Labels != nil {
-		for _, l := range e.Labels {
-			if l == label {
-				return true
-			}
+	for _, l := range e.Labels {
+		if l == label {
+			return true
 		}
 	}
 	return false
@@ -328,6 +364,11 @@ func (we WriteError) Error() string {
 // HasErrorCode returns true if the error has the specified code.
 func (we WriteError) HasErrorCode(code int) bool {
 	return we.Code == code
+}
+
+// ErrorCodes returns a list of error codes returned by the server.
+func (we WriteError) ErrorCodes() []int {
+	return []int{we.Code}
 }
 
 // HasErrorLabel returns true if the error contains the specified label. WriteErrors do not contain labels,
@@ -436,24 +477,28 @@ func (mwe WriteException) Error() string {
 
 // HasErrorCode returns true if the error has the specified code.
 func (mwe WriteException) HasErrorCode(code int) bool {
-	if mwe.WriteConcernError != nil && mwe.WriteConcernError.Code == code {
-		return true
+	return hasErrorCode(mwe, code)
+}
+
+// ErrorCodes returns a list of error codes returned by the server.
+func (mwe WriteException) ErrorCodes() []int {
+	errorCodes := []int{}
+	for _, writeError := range mwe.WriteErrors {
+		errorCodes = append(errorCodes, writeError.Code)
 	}
-	for _, we := range mwe.WriteErrors {
-		if we.Code == code {
-			return true
-		}
+
+	if mwe.WriteConcernError != nil {
+		errorCodes = append(errorCodes, mwe.WriteConcernError.Code)
 	}
-	return false
+
+	return errorCodes
 }
 
 // HasErrorLabel returns true if the error contains the specified label.
 func (mwe WriteException) HasErrorLabel(label string) bool {
-	if mwe.Labels != nil {
-		for _, l := range mwe.Labels {
-			if l == label {
-				return true
-			}
+	for _, l := range mwe.Labels {
+		if l == label {
+			return true
 		}
 	}
 	return false
@@ -550,24 +595,28 @@ func (bwe BulkWriteException) Error() string {
 
 // HasErrorCode returns true if any of the errors have the specified code.
 func (bwe BulkWriteException) HasErrorCode(code int) bool {
-	if bwe.WriteConcernError != nil && bwe.WriteConcernError.Code == code {
-		return true
+	return hasErrorCode(bwe, code)
+}
+
+// ErrorCodes returns a list of error codes returned by the server.
+func (bwe BulkWriteException) ErrorCodes() []int {
+	errorCodes := []int{}
+	for _, writeError := range bwe.WriteErrors {
+		errorCodes = append(errorCodes, writeError.Code)
 	}
-	for _, we := range bwe.WriteErrors {
-		if we.Code == code {
-			return true
-		}
+
+	if bwe.WriteConcernError != nil {
+		errorCodes = append(errorCodes, bwe.WriteConcernError.Code)
 	}
-	return false
+
+	return errorCodes
 }
 
 // HasErrorLabel returns true if the error contains the specified label.
 func (bwe BulkWriteException) HasErrorLabel(label string) bool {
-	if bwe.Labels != nil {
-		for _, l := range bwe.Labels {
-			if l == label {
-				return true
-			}
+	for _, l := range bwe.Labels {
+		if l == label {
+			return true
 		}
 	}
 	return false
@@ -603,6 +652,56 @@ func (bwe BulkWriteException) HasErrorCodeWithMessage(code int, message string) 
 // serverError implements the ServerError interface.
 func (bwe BulkWriteException) serverError() {}
 
+// ClientBulkWriteException is the error type returned by ClientBulkWrite operations.
+type ClientBulkWriteException struct {
+	// A top-level error that occurred when attempting to communicate with the server
+	// or execute the bulk write. This value may not be populated if the exception was
+	// thrown due to errors occurring on individual writes.
+	WriteError *WriteError
+
+	// The write concern errors that occurred.
+	WriteConcernErrors []WriteConcernError
+
+	// The write errors that occurred during individual operation execution.
+	// This map will contain at most one entry if the bulk write was ordered.
+	WriteErrors map[int]WriteError
+
+	// The results of any successful operations that were performed before the error
+	// was encountered.
+	PartialResult *ClientBulkWriteResult
+}
+
+// Error implements the error interface.
+func (bwe ClientBulkWriteException) Error() string {
+	causes := make([]string, 0, 4)
+	if bwe.WriteError != nil {
+		causes = append(causes, "top level error: "+bwe.WriteError.Error())
+	}
+	if len(bwe.WriteConcernErrors) > 0 {
+		errs := make([]error, len(bwe.WriteConcernErrors))
+		for i := 0; i < len(bwe.WriteConcernErrors); i++ {
+			errs[i] = bwe.WriteConcernErrors[i]
+		}
+		causes = append(causes, "write concern errors: "+joinBatchErrors(errs))
+	}
+	if len(bwe.WriteErrors) > 0 {
+		errs := make([]error, 0, len(bwe.WriteErrors))
+		for _, v := range bwe.WriteErrors {
+			errs = append(errs, v)
+		}
+		causes = append(causes, "write errors: "+joinBatchErrors(errs))
+	}
+	if bwe.PartialResult != nil {
+		causes = append(causes, fmt.Sprintf("result: %v", *bwe.PartialResult))
+	}
+
+	message := "bulk write exception: "
+	if len(causes) == 0 {
+		return message + "no causes"
+	}
+	return "bulk write exception: " + strings.Join(causes, ", ")
+}
+
 // returnResult is used to determine if a function calling processWriteError should return
 // the result or return nil. Since the processWriteError function is used by many different
 // methods, both *One and *Many, we need a way to differentiate if the method should return
@@ -613,9 +712,15 @@ const (
 	rrNone returnResult = 1 << iota // None means do not return the result ever.
 	rrOne                           // One means return the result if this was called by a *One method.
 	rrMany                          // Many means return the result is this was called by a *Many method.
+	rrUnacknowledged
 
-	rrAll returnResult = rrOne | rrMany // All means always return the result.
+	rrAll               returnResult = rrOne | rrMany           // All means always return the result.
+	rrAllUnacknowledged returnResult = rrAll | rrUnacknowledged // All + unacknowledged write
 )
+
+func (rr returnResult) isAcknowledged() bool {
+	return rr&rrUnacknowledged == 0
+}
 
 // processWriteError handles processing the result of a write operation. If the retrunResult matches
 // the calling method's type, it should return the result object in addition to the error.
@@ -623,23 +728,28 @@ const (
 //
 // WriteConcernError will be returned over WriteErrors if both are present.
 func processWriteError(err error) (returnResult, error) {
-	switch {
-	case err == driver.ErrUnacknowledgedWrite:
-		return rrAll, ErrUnacknowledgedWrite
-	case err != nil:
-		switch tt := err.(type) {
-		case driver.WriteCommandError:
-			return rrMany, WriteException{
-				WriteConcernError: convertDriverWriteConcernError(tt.WriteConcernError),
-				WriteErrors:       writeErrorsFromDriverWriteErrors(tt.WriteErrors),
-				Labels:            tt.Labels,
-				Raw:               bson.Raw(tt.Raw),
-			}
-		default:
-			return rrNone, replaceErrors(err)
-		}
-	default:
+	if err == nil {
 		return rrAll, nil
+	}
+	// Do not propagate the acknowledgement sentinel error. For DDL commands,
+	// (creating indexes, dropping collections, etc) acknowledgement should be
+	// ignored. For non-DDL write commands (insert, update, etc), acknowledgement
+	// should be be propagated at the result-level: e.g.,
+	// SingleResult.Acknowledged.
+	if err == driver.ErrUnacknowledgedWrite {
+		return rrAllUnacknowledged, nil
+	}
+
+	wce, ok := err.(driver.WriteCommandError)
+	if !ok {
+		return rrNone, replaceErrors(err)
+	}
+
+	return rrMany, WriteException{
+		WriteConcernError: convertDriverWriteConcernError(wce.WriteConcernError),
+		WriteErrors:       writeErrorsFromDriverWriteErrors(wce.WriteErrors),
+		Labels:            wce.Labels,
+		Raw:               bson.Raw(wce.Raw),
 	}
 }
 

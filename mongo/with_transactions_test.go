@@ -9,22 +9,24 @@ package mongo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/assert"
-	"go.mongodb.org/mongo-driver/internal/integtest"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
-	"go.mongodb.org/mongo-driver/mongo/writeconcern"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/assert"
+	"go.mongodb.org/mongo-driver/v2/internal/integtest"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 )
 
 var (
@@ -32,21 +34,12 @@ var (
 	errorInterrupted int32 = 11601
 )
 
-type wrappedError struct {
-	err error
-}
-
-func (we wrappedError) Error() string {
-	return we.err.Error()
-}
-
-func (we wrappedError) Unwrap() error {
-	return we.err
-}
-
 func TestConvenientTransactions(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
+	}
+	if os.Getenv("DOCKER_RUNNING") != "" {
+		t.Skip("skipping test in docker environment")
 	}
 
 	client := setupConvenientTransactions(t)
@@ -83,7 +76,7 @@ func TestConvenientTransactions(t *testing.T) {
 		defer sess.EndSession(context.Background())
 
 		testErr := errors.New("test error")
-		_, err = sess.WithTransaction(context.Background(), func(SessionContext) (interface{}, error) {
+		_, err = sess.WithTransaction(context.Background(), func(context.Context) (interface{}, error) {
 			return nil, testErr
 		})
 		assert.Equal(t, testErr, err, "expected error %v, got %v", testErr, err)
@@ -97,7 +90,7 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		res, err := sess.WithTransaction(context.Background(), func(SessionContext) (interface{}, error) {
+		res, err := sess.WithTransaction(context.Background(), func(context.Context) (interface{}, error) {
 			return false, nil
 		})
 		assert.Nil(t, err, "WithTransaction error: %v", err)
@@ -117,7 +110,7 @@ func TestConvenientTransactions(t *testing.T) {
 			assert.Nil(t, err, "StartSession error: %v", err)
 			defer sess.EndSession(context.Background())
 
-			_, err = sess.WithTransaction(context.Background(), func(SessionContext) (interface{}, error) {
+			_, err = sess.WithTransaction(context.Background(), func(context.Context) (interface{}, error) {
 				return nil, CommandError{Name: "test Error", Labels: []string{driver.TransientTransactionError}}
 			})
 			assert.NotNil(t, err, "expected WithTransaction error, got nil")
@@ -127,7 +120,7 @@ func TestConvenientTransactions(t *testing.T) {
 				"expected error with label %v, got %v", driver.TransientTransactionError, cmdErr)
 		})
 		t.Run("unknown transaction commit result", func(t *testing.T) {
-			//set failpoint
+			// set failpoint
 			failpoint := bson.D{{"configureFailPoint", "failCommand"},
 				{"mode", "alwaysOn"},
 				{"data", bson.D{
@@ -149,7 +142,7 @@ func TestConvenientTransactions(t *testing.T) {
 			assert.Nil(t, err, "StartSession error: %v", err)
 			defer sess.EndSession(context.Background())
 
-			_, err = sess.WithTransaction(context.Background(), func(ctx SessionContext) (interface{}, error) {
+			_, err = sess.WithTransaction(context.Background(), func(ctx context.Context) (interface{}, error) {
 				_, err := coll.InsertOne(ctx, bson.D{{"x", 1}})
 				return nil, err
 			})
@@ -160,7 +153,7 @@ func TestConvenientTransactions(t *testing.T) {
 				"expected error with label %v, got %v", driver.UnknownTransactionCommitResult, cmdErr)
 		})
 		t.Run("commit transient transaction error", func(t *testing.T) {
-			//set failpoint
+			// set failpoint
 			failpoint := bson.D{{"configureFailPoint", "failCommand"},
 				{"mode", "alwaysOn"},
 				{"data", bson.D{
@@ -182,7 +175,7 @@ func TestConvenientTransactions(t *testing.T) {
 			assert.Nil(t, err, "StartSession error: %v", err)
 			defer sess.EndSession(context.Background())
 
-			_, err = sess.WithTransaction(context.Background(), func(ctx SessionContext) (interface{}, error) {
+			_, err = sess.WithTransaction(context.Background(), func(ctx context.Context) (interface{}, error) {
 				_, err := coll.InsertOne(ctx, bson.D{{"x", 1}})
 				return nil, err
 			})
@@ -247,8 +240,8 @@ func TestConvenientTransactions(t *testing.T) {
 		// insert succeeds, it cancels the Context created above and returns a non-retryable error, which forces
 		// WithTransaction to abort the txn.
 		callbackErr := errors.New("error")
-		callback := func(sc SessionContext) (interface{}, error) {
-			_, err = coll.InsertOne(sc, bson.D{{"x", 1}})
+		callback := func(ctx context.Context) (interface{}, error) {
+			_, err = coll.InsertOne(ctx, bson.D{{"x", 1}})
 			if err != nil {
 				return nil, err
 			}
@@ -278,7 +271,7 @@ func TestConvenientTransactions(t *testing.T) {
 		var abortSucceeded []*event.CommandSucceededEvent
 		var abortFailed []*event.CommandFailedEvent
 		monitor := &event.CommandMonitor{
-			Started: func(ctx context.Context, evt *event.CommandStartedEvent) {
+			Started: func(_ context.Context, evt *event.CommandStartedEvent) {
 				if evt.CommandName == "abortTransaction" {
 					abortStarted = append(abortStarted, evt)
 				}
@@ -313,17 +306,17 @@ func TestConvenientTransactions(t *testing.T) {
 		defer session.EndSession(bgCtx)
 		assert.Nil(t, err, "StartSession error: %v", err)
 
-		_ = WithSession(bgCtx, session, func(sessionContext SessionContext) error {
+		_ = WithSession(bgCtx, session, func(ctx context.Context) error {
 			// Start transaction.
 			err = session.StartTransaction()
 			assert.Nil(t, err, "StartTransaction error: %v", err)
 
 			// Insert a document.
-			_, err := coll.InsertOne(sessionContext, bson.D{{"val", 17}})
+			_, err := coll.InsertOne(ctx, bson.D{{"val", 17}})
 			assert.Nil(t, err, "InsertOne error: %v", err)
 
 			// Set a timeout of 0 for commitTransaction.
-			commitTimeoutCtx, commitCancel := context.WithTimeout(sessionContext, 0)
+			commitTimeoutCtx, commitCancel := context.WithTimeout(ctx, 0)
 			defer commitCancel()
 
 			// CommitTransaction results in context.DeadlineExceeded.
@@ -332,7 +325,7 @@ func TestConvenientTransactions(t *testing.T) {
 				"expected timeout error error; got %v", commitErr)
 
 			// Assert session state is not Committed.
-			clientSession := session.(XSession).ClientSession()
+			clientSession := session.ClientSession()
 			assert.False(t, clientSession.TransactionCommitted(), "expected session state to not be Committed")
 
 			// AbortTransaction without error.
@@ -356,7 +349,7 @@ func TestConvenientTransactions(t *testing.T) {
 		var abortSucceeded []*event.CommandSucceededEvent
 		var abortFailed []*event.CommandFailedEvent
 		monitor := &event.CommandMonitor{
-			Started: func(ctx context.Context, evt *event.CommandStartedEvent) {
+			Started: func(_ context.Context, evt *event.CommandStartedEvent) {
 				if evt.CommandName == "abortTransaction" {
 					abortStarted = append(abortStarted, evt)
 				}
@@ -406,19 +399,23 @@ func TestConvenientTransactions(t *testing.T) {
 
 		// Insert a document within a session and manually cancel context before
 		// "commitTransaction" can be sent.
-		callback := func(ctx context.Context) {
-			transactionCtx, cancel := context.WithCancel(ctx)
-
-			_, _ = sess.WithTransaction(transactionCtx, func(ctx SessionContext) (interface{}, error) {
+		callback := func() bool {
+			transactionCtx, cancel := context.WithCancel(context.Background())
+			_, _ = sess.WithTransaction(transactionCtx, func(ctx context.Context) (interface{}, error) {
 				_, err := coll.InsertOne(ctx, bson.M{"x": 1})
-				assert.Nil(t, err, "InsertOne error: %v", err)
+				assert.NoError(t, err, "InsertOne error: %v", err)
 				cancel()
 				return nil, nil
 			})
+			return true
 		}
 
 		// Assert that transaction is canceled within 500ms and not 2 seconds.
-		assert.Soon(t, callback, 500*time.Millisecond)
+		assert.Eventually(t,
+			callback,
+			500*time.Millisecond,
+			time.Millisecond,
+			"expected transaction to be canceled within 500ms")
 
 		// Assert that AbortTransaction was started once and succeeded.
 		assert.Equal(t, 1, len(abortStarted), "expected 1 abortTransaction started event, got %d", len(abortStarted))
@@ -433,15 +430,15 @@ func TestConvenientTransactions(t *testing.T) {
 
 		// returnError tracks whether or not the callback is being retried
 		returnError := true
-		res, err := sess.WithTransaction(context.Background(), func(SessionContext) (interface{}, error) {
+		res, err := sess.WithTransaction(context.Background(), func(context.Context) (interface{}, error) {
 			if returnError {
 				returnError = false
-				return nil, wrappedError{
+				return nil, fmt.Errorf("%w",
 					CommandError{
 						Name:   "test Error",
 						Labels: []string{driver.TransientTransactionError},
 					},
-				}
+				)
 			}
 			return false, nil
 		})
@@ -466,19 +463,24 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		callback := func(ctx context.Context) {
+		callback := func() bool {
 			// Create transaction context with short timeout.
-			withTransactionContext, cancel := context.WithTimeout(ctx, time.Nanosecond)
+			withTransactionContext, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 			defer cancel()
 
-			_, _ = sess.WithTransaction(withTransactionContext, func(ctx SessionContext) (interface{}, error) {
+			_, _ = sess.WithTransaction(withTransactionContext, func(ctx context.Context) (interface{}, error) {
 				_, err := coll.InsertOne(ctx, bson.D{{}})
 				return nil, err
 			})
+			return true
 		}
 
 		// Assert that transaction fails within 500ms and not 2 seconds.
-		assert.Soon(t, callback, 500*time.Millisecond)
+		assert.Eventually(t,
+			callback,
+			500*time.Millisecond,
+			time.Millisecond,
+			"expected transaction to fail within 500ms")
 	})
 	t.Run("canceled context before callback does not retry", func(t *testing.T) {
 		withTransactionTimeout = 2 * time.Second
@@ -496,19 +498,24 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		callback := func(ctx context.Context) {
+		callback := func() bool {
 			// Create transaction context and cancel it immediately.
-			withTransactionContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+			withTransactionContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			cancel()
 
-			_, _ = sess.WithTransaction(withTransactionContext, func(ctx SessionContext) (interface{}, error) {
+			_, _ = sess.WithTransaction(withTransactionContext, func(ctx context.Context) (interface{}, error) {
 				_, err := coll.InsertOne(ctx, bson.D{{}})
 				return nil, err
 			})
+			return true
 		}
 
 		// Assert that transaction fails within 500ms and not 2 seconds.
-		assert.Soon(t, callback, 500*time.Millisecond)
+		assert.Eventually(t,
+			callback,
+			500*time.Millisecond,
+			time.Millisecond,
+			"expected transaction to fail within 500ms")
 	})
 	t.Run("slow operation in callback retries", func(t *testing.T) {
 		withTransactionTimeout = 2 * time.Second
@@ -547,8 +554,8 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		callback := func(ctx context.Context) {
-			_, err = sess.WithTransaction(ctx, func(ctx SessionContext) (interface{}, error) {
+		callback := func() bool {
+			_, err = sess.WithTransaction(context.Background(), func(ctx context.Context) (interface{}, error) {
 				// Set a timeout of 300ms to cause a timeout on first insertOne
 				// and force a retry.
 				c, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
@@ -557,11 +564,17 @@ func TestConvenientTransactions(t *testing.T) {
 				_, err := coll.InsertOne(c, bson.D{{}})
 				return nil, err
 			})
-			assert.Nil(t, err, "WithTransaction error: %v", err)
+			assert.NoError(t, err, "WithTransaction error: %v", err)
+			return true
 		}
 
 		// Assert that transaction passes within 2 seconds.
-		assert.Soon(t, callback, 2*time.Second)
+		assert.Eventually(t,
+			callback,
+			withTransactionTimeout,
+			time.Millisecond,
+			"expected transaction to be passed within 2s")
+
 	})
 }
 
@@ -570,9 +583,9 @@ func setupConvenientTransactions(t *testing.T, extraClientOpts ...*options.Clien
 	poolMonitor := &event.PoolMonitor{
 		Event: func(evt *event.PoolEvent) {
 			switch evt.Type {
-			case event.GetSucceeded:
+			case event.ConnectionCheckedOut:
 				connsCheckedOut++
-			case event.ConnectionReturned:
+			case event.ConnectionCheckedIn:
 				connsCheckedOut--
 			}
 		},
@@ -581,30 +594,30 @@ func setupConvenientTransactions(t *testing.T, extraClientOpts ...*options.Clien
 	baseClientOpts := options.Client().
 		ApplyURI(cs.Original).
 		SetReadPreference(readpref.Primary()).
-		SetWriteConcern(writeconcern.New(writeconcern.WMajority())).
+		SetWriteConcern(writeconcern.Majority()).
 		SetPoolMonitor(poolMonitor)
 	integtest.AddTestServerAPIVersion(baseClientOpts)
 	fullClientOpts := []*options.ClientOptions{baseClientOpts}
 	fullClientOpts = append(fullClientOpts, extraClientOpts...)
 
-	client, err := Connect(bgCtx, fullClientOpts...)
+	client, err := Connect(fullClientOpts...)
 	assert.Nil(t, err, "Connect error: %v", err)
 
 	version, err := getServerVersion(client.Database("admin"))
 	assert.Nil(t, err, "getServerVersion error: %v", err)
 	topoKind := client.deployment.(*topology.Topology).Kind()
-	if compareVersions(version, "4.1") < 0 || topoKind == description.Single {
+	if compareVersions(version, "4.1") < 0 || topoKind == description.TopologyKindSingle {
 		t.Skip("skipping standalones and versions < 4.1")
 	}
 
-	if topoKind != description.Sharded {
+	if topoKind != description.TopologyKindSharded {
 		return client
 	}
 
 	// For sharded clusters, disconnect the previous Client and create a new one that's pinned to a single mongos.
 	_ = client.Disconnect(bgCtx)
 	fullClientOpts = append(fullClientOpts, options.Client().SetHosts([]string{cs.Hosts[0]}))
-	client, err = Connect(bgCtx, fullClientOpts...)
+	client, err = Connect(fullClientOpts...)
 	assert.Nil(t, err, "Connect error: %v", err)
 	return client
 }
@@ -613,7 +626,7 @@ func getServerVersion(db *Database) (string, error) {
 	serverStatus, err := db.RunCommand(
 		context.Background(),
 		bson.D{{"serverStatus", 1}},
-	).DecodeBytes()
+	).Raw()
 	if err != nil {
 		return "", err
 	}

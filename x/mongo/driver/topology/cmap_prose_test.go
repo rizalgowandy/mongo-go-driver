@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/assert"
-	"go.mongodb.org/mongo-driver/internal/require"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/assert"
+	"go.mongodb.org/mongo-driver/v2/internal/require"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/operation"
 )
 
 func TestCMAPProse(t *testing.T) {
@@ -241,7 +241,7 @@ func TestCMAPProse(t *testing.T) {
 				conns = conns[2:]
 				assertConnectionCounts(t, pool, numConns, 0)
 
-				// Close and assert that events are published for all conections.
+				// Close and assert that events are published for all connections.
 				pool.close(context.Background())
 				assertConnectionCounts(t, pool, numConns, numConns)
 

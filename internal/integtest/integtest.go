@@ -18,18 +18,18 @@ import (
 	"sync"
 	"testing"
 
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/require"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/require"
+	"go.mongodb.org/mongo-driver/v2/internal/serverselector"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/operation"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 )
 
-var connectionString connstring.ConnString
+var connectionString *connstring.ConnString
 var connectionStringOnce sync.Once
 var connectionStringErr error
 var liveTopology *topology.Topology
@@ -90,7 +90,10 @@ func MonitoredTopology(t *testing.T, dbName string, monitor *event.CommandMonito
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := topology.NewConfig(options.Client().ApplyURI(uri).SetMonitor(monitor), nil)
+
+	opts := options.Client().ApplyURI(uri).SetMonitor(monitor)
+
+	cfg, err := topology.NewConfig(opts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +105,7 @@ func MonitoredTopology(t *testing.T, dbName string, monitor *event.CommandMonito
 		_ = monitoredTopology.Connect()
 
 		err = operation.NewCommand(bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "dropDatabase", 1))).
-			Database(dbName).ServerSelector(description.WriteSelector()).Deployment(monitoredTopology).Execute(context.Background())
+			Database(dbName).ServerSelector(&serverselector.Write{}).Deployment(monitoredTopology).Execute(context.Background())
 
 		require.NoError(t, err)
 	}
@@ -114,7 +117,10 @@ func MonitoredTopology(t *testing.T, dbName string, monitor *event.CommandMonito
 func Topology(t *testing.T) *topology.Topology {
 	uri, err := MongoDBURI()
 	require.NoError(t, err, "error constructing mongodb URI: %v", err)
-	cfg, err := topology.NewConfig(options.Client().ApplyURI(uri), nil)
+
+	opts := options.Client().ApplyURI(uri)
+
+	cfg, err := topology.NewConfig(opts, nil)
 	require.NoError(t, err, "error constructing topology config: %v", err)
 
 	liveTopologyOnce.Do(func() {
@@ -126,7 +132,8 @@ func Topology(t *testing.T) *topology.Topology {
 			_ = liveTopology.Connect()
 
 			err = operation.NewCommand(bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "dropDatabase", 1))).
-				Database(DBName(t)).ServerSelector(description.WriteSelector()).Deployment(liveTopology).Execute(context.Background())
+				Database(DBName(t)).ServerSelector(&serverselector.Write{}).
+				Deployment(liveTopology).Execute(context.Background())
 			require.NoError(t, err)
 		}
 	})
@@ -144,7 +151,10 @@ func TopologyWithCredential(t *testing.T, credential options.Credential) *topolo
 	if err != nil {
 		t.Fatalf("error constructing mongodb URI: %v", err)
 	}
-	cfg, err := topology.NewConfig(options.Client().ApplyURI(uri).SetAuth(credential), nil)
+
+	opts := options.Client().ApplyURI(uri).SetAuth(credential)
+
+	cfg, err := topology.NewConfig(opts, nil)
 	if err != nil {
 		t.Fatalf("error constructing topology config: %v", err)
 	}
@@ -198,11 +208,12 @@ func AddServerlessAuthCredentials(uri string) (string, error) {
 
 	var scheme string
 	// remove the scheme
-	if strings.HasPrefix(uri, "mongodb+srv://") {
+	switch {
+	case strings.HasPrefix(uri, "mongodb+srv://"):
 		scheme = "mongodb+srv://"
-	} else if strings.HasPrefix(uri, "mongodb://") {
+	case strings.HasPrefix(uri, "mongodb://"):
 		scheme = "mongodb://"
-	} else {
+	default:
 		return "", errors.New(`scheme must be "mongodb" or "mongodb+srv"`)
 	}
 
@@ -211,7 +222,7 @@ func AddServerlessAuthCredentials(uri string) (string, error) {
 }
 
 // ConnString gets the globally configured connection string.
-func ConnString(t *testing.T) connstring.ConnString {
+func ConnString(t *testing.T) *connstring.ConnString {
 	connectionStringOnce.Do(func() {
 		uri, err := MongoDBURI()
 		require.NoError(t, err, "error constructing mongodb URI: %v", err)
@@ -228,7 +239,7 @@ func ConnString(t *testing.T) connstring.ConnString {
 	return connectionString
 }
 
-func GetConnString() (connstring.ConnString, error) {
+func GetConnString() (*connstring.ConnString, error) {
 	mongodbURI := os.Getenv("MONGODB_URI")
 	if mongodbURI == "" {
 		mongodbURI = "mongodb://localhost:27017"
@@ -238,7 +249,7 @@ func GetConnString() (connstring.ConnString, error) {
 
 	cs, err := connstring.ParseAndValidate(mongodbURI)
 	if err != nil {
-		return connstring.ConnString{}, err
+		return nil, err
 	}
 
 	return cs, nil
@@ -249,7 +260,7 @@ func DBName(t *testing.T) string {
 	return GetDBName(ConnString(t))
 }
 
-func GetDBName(cs connstring.ConnString) string {
+func GetDBName(cs *connstring.ConnString) string {
 	if cs.Database != "" {
 		return cs.Database
 	}

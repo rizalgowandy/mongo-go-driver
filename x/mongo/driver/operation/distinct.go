@@ -11,27 +11,27 @@ import (
 	"errors"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/bsontype"
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/driverutil"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/readconcern"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // Distinct performs a distinct operation.
 type Distinct struct {
+	authenticator  driver.Authenticator
 	collation      bsoncore.Document
 	key            *string
-	maxTime        *time.Duration
 	query          bsoncore.Document
 	session        *session.Client
 	clock          *session.ClusterClock
 	collection     string
 	comment        bsoncore.Value
+	hint           bsoncore.Value
 	monitor        *event.CommandMonitor
 	crypt          driver.Crypt
 	database       string
@@ -58,8 +58,7 @@ func buildDistinctResult(response bsoncore.Document) (DistinctResult, error) {
 	}
 	dr := DistinctResult{}
 	for _, element := range elements {
-		switch element.Key() {
-		case "values":
+		if element.Key() == "values" {
 			dr.Values = element.Value()
 		}
 	}
@@ -77,9 +76,9 @@ func NewDistinct(key string, query bsoncore.Document) *Distinct {
 // Result returns the result of executing this operation.
 func (d *Distinct) Result() DistinctResult { return d.result }
 
-func (d *Distinct) processResponse(info driver.ResponseInfo) error {
+func (d *Distinct) processResponse(_ context.Context, resp bsoncore.Document, _ driver.ResponseInfo) error {
 	var err error
-	d.result, err = buildDistinctResult(info.ServerResponse)
+	d.result, err = buildDistinctResult(resp)
 	return err
 }
 
@@ -100,13 +99,13 @@ func (d *Distinct) Execute(ctx context.Context) error {
 		Crypt:             d.crypt,
 		Database:          d.database,
 		Deployment:        d.deployment,
-		MaxTime:           d.maxTime,
 		ReadConcern:       d.readConcern,
 		ReadPreference:    d.readPreference,
 		Selector:          d.selector,
 		ServerAPI:         d.serverAPI,
 		Timeout:           d.timeout,
 		Name:              driverutil.DistinctOp,
+		Authenticator:     d.authenticator,
 	}.Execute(ctx)
 
 }
@@ -114,13 +113,16 @@ func (d *Distinct) Execute(ctx context.Context) error {
 func (d *Distinct) command(dst []byte, desc description.SelectedServer) ([]byte, error) {
 	dst = bsoncore.AppendStringElement(dst, "distinct", d.collection)
 	if d.collation != nil {
-		if desc.WireVersion == nil || !desc.WireVersion.Includes(5) {
+		if desc.WireVersion == nil || !driverutil.VersionRangeIncludes(*desc.WireVersion, 5) {
 			return nil, errors.New("the 'collation' command parameter requires a minimum server wire version of 5")
 		}
 		dst = bsoncore.AppendDocumentElement(dst, "collation", d.collation)
 	}
-	if d.comment.Type != bsontype.Type(0) {
+	if d.comment.Type != bsoncore.Type(0) {
 		dst = bsoncore.AppendValueElement(dst, "comment", d.comment)
+	}
+	if d.hint.Type != bsoncore.Type(0) {
+		dst = bsoncore.AppendValueElement(dst, "hint", d.hint)
 	}
 	if d.key != nil {
 		dst = bsoncore.AppendStringElement(dst, "key", *d.key)
@@ -148,16 +150,6 @@ func (d *Distinct) Key(key string) *Distinct {
 	}
 
 	d.key = &key
-	return d
-}
-
-// MaxTime specifies the maximum amount of time to allow the query to run on the server.
-func (d *Distinct) MaxTime(maxTime *time.Duration) *Distinct {
-	if d == nil {
-		d = new(Distinct)
-	}
-
-	d.maxTime = maxTime
 	return d
 }
 
@@ -208,6 +200,16 @@ func (d *Distinct) Comment(comment bsoncore.Value) *Distinct {
 	}
 
 	d.comment = comment
+	return d
+}
+
+// Hint sets a value to help trace an operation.
+func (d *Distinct) Hint(hint bsoncore.Value) *Distinct {
+	if d == nil {
+		d = new(Distinct)
+	}
+
+	d.hint = hint
 	return d
 }
 
@@ -309,5 +311,15 @@ func (d *Distinct) Timeout(timeout *time.Duration) *Distinct {
 	}
 
 	d.timeout = timeout
+	return d
+}
+
+// Authenticator sets the authenticator to use for this operation.
+func (d *Distinct) Authenticator(authenticator driver.Authenticator) *Distinct {
+	if d == nil {
+		d = new(Distinct)
+	}
+
+	d.authenticator = authenticator
 	return d
 }

@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/internal/assert"
-	"go.mongodb.org/mongo-driver/internal/integtest"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/internal/assert"
+	"go.mongodb.org/mongo-driver/v2/internal/integtest"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 func TestOCSP(t *testing.T) {
@@ -32,9 +32,9 @@ func TestOCSP(t *testing.T) {
 
 	t.Run("tls", func(t *testing.T) {
 		clientOpts := createOCSPClientOptions(cs.Original)
-		client, err := Connect(bgCtx, clientOpts)
+		client, err := Connect(clientOpts)
 		assert.Nil(t, err, "Connect error: %v", err)
-		defer client.Disconnect(bgCtx)
+		defer func() { _ = client.Disconnect(bgCtx) }()
 
 		err = client.Ping(bgCtx, readpref.Primary())
 		if shouldSucceed {
@@ -47,9 +47,9 @@ func TestOCSP(t *testing.T) {
 	})
 	t.Run("tlsInsecure", func(t *testing.T) {
 		clientOpts := createInsecureOCSPClientOptions(cs.Original)
-		client, err := Connect(bgCtx, clientOpts)
+		client, err := Connect(clientOpts)
 		assert.Nil(t, err, "Connect error: %v", err)
-		defer client.Disconnect(bgCtx)
+		defer func() { _ = client.Disconnect(bgCtx) }()
 
 		err = client.Ping(bgCtx, readpref.Primary())
 		assert.Nil(t, err, "Ping error: %v", err)
@@ -73,8 +73,11 @@ func createInsecureOCSPClientOptions(uri string) *options.ClientOptions {
 
 	if opts.TLSConfig != nil {
 		opts.TLSConfig.InsecureSkipVerify = true
+		opts.SetTLSConfig(opts.TLSConfig)
+
 		return opts
 	}
+
 	return opts.SetTLSConfig(&tls.Config{
 		InsecureSkipVerify: true,
 	})

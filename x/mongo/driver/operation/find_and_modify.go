@@ -12,25 +12,24 @@ import (
 	"fmt"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/driverutil"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/writeconcern"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // FindAndModify performs a findAndModify operation.
 type FindAndModify struct {
+	authenticator            driver.Authenticator
 	arrayFilters             bsoncore.Array
 	bypassDocumentValidation *bool
 	collation                bsoncore.Document
 	comment                  bsoncore.Value
 	fields                   bsoncore.Document
-	maxTime                  *time.Duration
 	newDocument              *bool
 	query                    bsoncore.Document
 	remove                   *bool
@@ -84,7 +83,7 @@ func buildFindAndModifyResult(response bsoncore.Document) (FindAndModifyResult, 
 			famr.Value, ok = element.Value().DocumentOK()
 
 			// The 'value' field returned by a FindAndModify can be null in the case that no document was found.
-			if element.Value().Type != bsontype.Null && !ok {
+			if element.Value().Type != bsoncore.TypeNull && !ok {
 				return famr, fmt.Errorf("response field 'value' is type document or null, but received BSON type %s", element.Value().Type)
 			}
 		case "lastErrorObject":
@@ -113,10 +112,10 @@ func NewFindAndModify(query bsoncore.Document) *FindAndModify {
 // Result returns the result of executing this operation.
 func (fam *FindAndModify) Result() FindAndModifyResult { return fam.result }
 
-func (fam *FindAndModify) processResponse(info driver.ResponseInfo) error {
+func (fam *FindAndModify) processResponse(_ context.Context, resp bsoncore.Document, _ driver.ResponseInfo) error {
 	var err error
 
-	fam.result, err = buildFindAndModifyResult(info.ServerResponse)
+	fam.result, err = buildFindAndModifyResult(resp)
 	return err
 
 }
@@ -138,13 +137,13 @@ func (fam *FindAndModify) Execute(ctx context.Context) error {
 		CommandMonitor: fam.monitor,
 		Database:       fam.database,
 		Deployment:     fam.deployment,
-		MaxTime:        fam.maxTime,
 		Selector:       fam.selector,
 		WriteConcern:   fam.writeConcern,
 		Crypt:          fam.crypt,
 		ServerAPI:      fam.serverAPI,
 		Timeout:        fam.timeout,
 		Name:           driverutil.FindAndModifyOp,
+		Authenticator:  fam.authenticator,
 	}.Execute(ctx)
 
 }
@@ -153,7 +152,7 @@ func (fam *FindAndModify) command(dst []byte, desc description.SelectedServer) (
 	dst = bsoncore.AppendStringElement(dst, "findAndModify", fam.collection)
 	if fam.arrayFilters != nil {
 
-		if desc.WireVersion == nil || !desc.WireVersion.Includes(6) {
+		if desc.WireVersion == nil || !driverutil.VersionRangeIncludes(*desc.WireVersion, 6) {
 			return nil, errors.New("the 'arrayFilters' command parameter requires a minimum server wire version of 6")
 		}
 		dst = bsoncore.AppendArrayElement(dst, "arrayFilters", fam.arrayFilters)
@@ -164,12 +163,12 @@ func (fam *FindAndModify) command(dst []byte, desc description.SelectedServer) (
 	}
 	if fam.collation != nil {
 
-		if desc.WireVersion == nil || !desc.WireVersion.Includes(5) {
+		if desc.WireVersion == nil || !driverutil.VersionRangeIncludes(*desc.WireVersion, 5) {
 			return nil, errors.New("the 'collation' command parameter requires a minimum server wire version of 5")
 		}
 		dst = bsoncore.AppendDocumentElement(dst, "collation", fam.collation)
 	}
-	if fam.comment.Type != bsontype.Type(0) {
+	if fam.comment.Type != bsoncore.Type(0) {
 		dst = bsoncore.AppendValueElement(dst, "comment", fam.comment)
 	}
 	if fam.fields != nil {
@@ -199,9 +198,9 @@ func (fam *FindAndModify) command(dst []byte, desc description.SelectedServer) (
 
 		dst = bsoncore.AppendBooleanElement(dst, "upsert", *fam.upsert)
 	}
-	if fam.hint.Type != bsontype.Type(0) {
+	if fam.hint.Type != bsoncore.Type(0) {
 
-		if desc.WireVersion == nil || !desc.WireVersion.Includes(8) {
+		if desc.WireVersion == nil || !driverutil.VersionRangeIncludes(*desc.WireVersion, 8) {
 			return nil, errors.New("the 'hint' command parameter requires a minimum server wire version of 8")
 		}
 		if !fam.writeConcern.Acknowledged() {
@@ -263,16 +262,6 @@ func (fam *FindAndModify) Fields(fields bsoncore.Document) *FindAndModify {
 	}
 
 	fam.fields = fields
-	return fam
-}
-
-// MaxTime specifies the maximum amount of time to allow the operation to run on the server.
-func (fam *FindAndModify) MaxTime(maxTime *time.Duration) *FindAndModify {
-	if fam == nil {
-		fam = new(FindAndModify)
-	}
-
-	fam.maxTime = maxTime
 	return fam
 }
 
@@ -475,5 +464,15 @@ func (fam *FindAndModify) Timeout(timeout *time.Duration) *FindAndModify {
 	}
 
 	fam.timeout = timeout
+	return fam
+}
+
+// Authenticator sets the authenticator to use for this operation.
+func (fam *FindAndModify) Authenticator(authenticator driver.Authenticator) *FindAndModify {
+	if fam == nil {
+		fam = new(FindAndModify)
+	}
+
+	fam.authenticator = authenticator
 	return fam
 }

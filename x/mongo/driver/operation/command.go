@@ -11,20 +11,19 @@ import (
 	"errors"
 	"time"
 
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/logger"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/readconcern"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/logger"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // Command is used to run a generic operation.
 type Command struct {
+	authenticator  driver.Authenticator
 	command        bsoncore.Document
-	readConcern    *readconcern.ReadConcern
 	database       string
 	deployment     driver.Deployment
 	selector       description.ServerSelector
@@ -79,16 +78,19 @@ func (c *Command) Execute(ctx context.Context) error {
 		return errors.New("the Command operation must have a Deployment set before Execute can be called")
 	}
 
-	// TODO(GODRIVER-2649): Actually pass readConcern to underlying driver.Operation.
 	return driver.Operation{
-		CommandFn: func(dst []byte, desc description.SelectedServer) ([]byte, error) {
+		CommandFn: func(dst []byte, _ description.SelectedServer) ([]byte, error) {
 			return append(dst, c.command[4:len(c.command)-1]...), nil
 		},
-		ProcessResponseFn: func(info driver.ResponseInfo) error {
-			c.resultResponse = info.ServerResponse
+		ProcessResponseFn: func(_ context.Context, resp bsoncore.Document, info driver.ResponseInfo) error {
+			c.resultResponse = resp
 
 			if c.createCursor {
-				cursorRes, err := driver.NewCursorResponse(info)
+				curDoc, err := driver.ExtractCursorDocument(resp)
+				if err != nil {
+					return err
+				}
+				cursorRes, err := driver.NewCursorResponse(curDoc, info)
 				if err != nil {
 					return err
 				}
@@ -110,6 +112,7 @@ func (c *Command) Execute(ctx context.Context) error {
 		ServerAPI:      c.serverAPI,
 		Timeout:        c.timeout,
 		Logger:         c.logger,
+		Authenticator:  c.authenticator,
 	}.Execute(ctx)
 }
 
@@ -160,16 +163,6 @@ func (c *Command) Deployment(deployment driver.Deployment) *Command {
 	}
 
 	c.deployment = deployment
-	return c
-}
-
-// ReadConcern specifies the read concern for this operation.
-func (c *Command) ReadConcern(readConcern *readconcern.ReadConcern) *Command {
-	if c == nil {
-		c = new(Command)
-	}
-
-	c.readConcern = readConcern
 	return c
 }
 
@@ -230,5 +223,15 @@ func (c *Command) Logger(logger *logger.Logger) *Command {
 	}
 
 	c.logger = logger
+	return c
+}
+
+// Authenticator sets the authenticator to use for this operation.
+func (c *Command) Authenticator(authenticator driver.Authenticator) *Command {
+	if c == nil {
+		c = new(Command)
+	}
+
+	c.authenticator = authenticator
 	return c
 }

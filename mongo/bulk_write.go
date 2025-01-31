@@ -8,16 +8,17 @@ package mongo
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
-	"go.mongodb.org/mongo-driver/bson/bsoncodec"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/writeconcern"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/operation"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 type bulkWriteBatch struct {
@@ -26,7 +27,7 @@ type bulkWriteBatch struct {
 	indexes  []int
 }
 
-// bulkWrite perfoms a bulkwrite operation
+// bulkWrite performs a bulkwrite operation
 type bulkWrite struct {
 	comment                  interface{}
 	ordered                  *bool
@@ -71,7 +72,7 @@ func (bw *bulkWrite) execute(ctx context.Context) error {
 
 		bwErr.WriteErrors = append(bwErr.WriteErrors, batchErr.WriteErrors...)
 
-		commandErrorOccurred := err != nil && err != driver.ErrUnacknowledgedWrite
+		commandErrorOccurred := err != nil && !errors.Is(err, driver.ErrUnacknowledgedWrite)
 		writeErrorOccurred := len(batchErr.WriteErrors) > 0 || batchErr.WriteConcernError != nil
 		if !continueOnError && (commandErrorOccurred || writeErrorOccurred) {
 			if err != nil {
@@ -87,10 +88,14 @@ func (bw *bulkWrite) execute(ctx context.Context) error {
 	}
 
 	bw.result.MatchedCount -= bw.result.UpsertedCount
-	if lastErr != nil {
-		_, lastErr = processWriteError(lastErr)
-		return lastErr
+
+	rr, err := processWriteError(lastErr)
+	if err != nil {
+		return err
 	}
+
+	bw.result.Acknowledged = rr.isAcknowledged()
+
 	if len(bwErr.WriteErrors) > 0 || bwErr.WriteConcernError != nil {
 		return bwErr
 	}
@@ -108,8 +113,8 @@ func (bw *bulkWrite) runBatch(ctx context.Context, batch bulkWriteBatch) (BulkWr
 	case *InsertOneModel:
 		res, err := bw.runInsert(ctx, batch)
 		if err != nil {
-			writeErr, ok := err.(driver.WriteCommandError)
-			if !ok {
+			var writeErr driver.WriteCommandError
+			if !errors.As(err, &writeErr) {
 				return BulkWriteResult{}, batchErr, err
 			}
 			writeErrors = writeErr.WriteErrors
@@ -120,8 +125,8 @@ func (bw *bulkWrite) runBatch(ctx context.Context, batch bulkWriteBatch) (BulkWr
 	case *DeleteOneModel, *DeleteManyModel:
 		res, err := bw.runDelete(ctx, batch)
 		if err != nil {
-			writeErr, ok := err.(driver.WriteCommandError)
-			if !ok {
+			var writeErr driver.WriteCommandError
+			if !errors.As(err, &writeErr) {
 				return BulkWriteResult{}, batchErr, err
 			}
 			writeErrors = writeErr.WriteErrors
@@ -132,8 +137,8 @@ func (bw *bulkWrite) runBatch(ctx context.Context, batch bulkWriteBatch) (BulkWr
 	case *ReplaceOneModel, *UpdateOneModel, *UpdateManyModel:
 		res, err := bw.runUpdate(ctx, batch)
 		if err != nil {
-			writeErr, ok := err.(driver.WriteCommandError)
-			if !ok {
+			var writeErr driver.WriteCommandError
+			if !errors.As(err, &writeErr) {
 				return BulkWriteResult{}, batchErr, err
 			}
 			writeErrors = writeErr.WriteErrors
@@ -163,20 +168,18 @@ func (bw *bulkWrite) runBatch(ctx context.Context, batch bulkWriteBatch) (BulkWr
 
 func (bw *bulkWrite) runInsert(ctx context.Context, batch bulkWriteBatch) (operation.InsertResult, error) {
 	docs := make([]bsoncore.Document, len(batch.models))
-	var i int
-	for _, model := range batch.models {
+	for i, model := range batch.models {
 		converted := model.(*InsertOneModel)
 		doc, err := marshal(converted.Document, bw.collection.bsonOpts, bw.collection.registry)
 		if err != nil {
 			return operation.InsertResult{}, err
 		}
-		doc, _, err = ensureID(doc, primitive.NewObjectID(), bw.collection.bsonOpts, bw.collection.registry)
+		doc, _, err = ensureID(doc, bson.NilObjectID, bw.collection.bsonOpts, bw.collection.registry)
 		if err != nil {
 			return operation.InsertResult{}, err
 		}
 
 		docs[i] = doc
-		i++
 	}
 
 	op := operation.NewInsert(docs...).
@@ -185,7 +188,7 @@ func (bw *bulkWrite) runInsert(ctx context.Context, batch bulkWriteBatch) (opera
 		Database(bw.collection.db.name).Collection(bw.collection.name).
 		Deployment(bw.collection.client.deployment).Crypt(bw.collection.client.cryptFLE).
 		ServerAPI(bw.collection.client.serverAPI).Timeout(bw.collection.client.timeout).
-		Logger(bw.collection.client.logger)
+		Logger(bw.collection.client.logger).Authenticator(bw.collection.client.authenticator)
 	if bw.comment != nil {
 		comment, err := marshalValue(bw.comment, bw.collection.bsonOpts, bw.collection.registry)
 		if err != nil {
@@ -255,7 +258,7 @@ func (bw *bulkWrite) runDelete(ctx context.Context, batch bulkWriteBatch) (opera
 		Database(bw.collection.db.name).Collection(bw.collection.name).
 		Deployment(bw.collection.client.deployment).Crypt(bw.collection.client.cryptFLE).Hint(hasHint).
 		ServerAPI(bw.collection.client.serverAPI).Timeout(bw.collection.client.timeout).
-		Logger(bw.collection.client.logger)
+		Logger(bw.collection.client.logger).Authenticator(bw.collection.client.authenticator)
 	if bw.comment != nil {
 		comment, err := marshalValue(bw.comment, bw.collection.bsonOpts, bw.collection.registry)
 		if err != nil {
@@ -290,8 +293,11 @@ func createDeleteDoc(
 	hint interface{},
 	deleteOne bool,
 	bsonOpts *options.BSONOptions,
-	registry *bsoncodec.Registry,
+	registry *bson.Registry,
 ) (bsoncore.Document, error) {
+	if filter == nil {
+		return nil, fmt.Errorf("delete filter cannot be nil")
+	}
 	f, err := marshal(filter, bsonOpts, registry)
 	if err != nil {
 		return nil, err
@@ -305,7 +311,7 @@ func createDeleteDoc(
 	doc = bsoncore.AppendDocumentElement(doc, "q", f)
 	doc = bsoncore.AppendInt32Element(doc, "limit", limit)
 	if collation != nil {
-		doc = bsoncore.AppendDocumentElement(doc, "collation", collation.ToDocument())
+		doc = bsoncore.AppendDocumentElement(doc, "collation", toDocument(collation))
 	}
 	if hint != nil {
 		if isUnorderedMap(hint) {
@@ -332,44 +338,39 @@ func (bw *bulkWrite) runUpdate(ctx context.Context, batch bulkWriteBatch) (opera
 
 		switch converted := model.(type) {
 		case *ReplaceOneModel:
-			doc, err = createUpdateDoc(
-				converted.Filter,
-				converted.Replacement,
-				converted.Hint,
-				nil,
-				converted.Collation,
-				converted.Upsert,
-				false,
-				false,
-				bw.collection.bsonOpts,
-				bw.collection.registry)
+			doc, err = updateDoc{
+				filter:    converted.Filter,
+				update:    converted.Replacement,
+				hint:      converted.Hint,
+				sort:      converted.Sort,
+				collation: converted.Collation,
+				upsert:    converted.Upsert,
+			}.marshal(bw.collection.bsonOpts, bw.collection.registry)
 			hasHint = hasHint || (converted.Hint != nil)
 		case *UpdateOneModel:
-			doc, err = createUpdateDoc(
-				converted.Filter,
-				converted.Update,
-				converted.Hint,
-				converted.ArrayFilters,
-				converted.Collation,
-				converted.Upsert,
-				false,
-				true,
-				bw.collection.bsonOpts,
-				bw.collection.registry)
+			doc, err = updateDoc{
+				filter:         converted.Filter,
+				update:         converted.Update,
+				hint:           converted.Hint,
+				sort:           converted.Sort,
+				arrayFilters:   converted.ArrayFilters,
+				collation:      converted.Collation,
+				upsert:         converted.Upsert,
+				checkDollarKey: true,
+			}.marshal(bw.collection.bsonOpts, bw.collection.registry)
 			hasHint = hasHint || (converted.Hint != nil)
 			hasArrayFilters = hasArrayFilters || (converted.ArrayFilters != nil)
 		case *UpdateManyModel:
-			doc, err = createUpdateDoc(
-				converted.Filter,
-				converted.Update,
-				converted.Hint,
-				converted.ArrayFilters,
-				converted.Collation,
-				converted.Upsert,
-				true,
-				true,
-				bw.collection.bsonOpts,
-				bw.collection.registry)
+			doc, err = updateDoc{
+				filter:         converted.Filter,
+				update:         converted.Update,
+				hint:           converted.Hint,
+				arrayFilters:   converted.ArrayFilters,
+				collation:      converted.Collation,
+				upsert:         converted.Upsert,
+				multi:          true,
+				checkDollarKey: true,
+			}.marshal(bw.collection.bsonOpts, bw.collection.registry)
 			hasHint = hasHint || (converted.Hint != nil)
 			hasArrayFilters = hasArrayFilters || (converted.ArrayFilters != nil)
 		}
@@ -386,7 +387,8 @@ func (bw *bulkWrite) runUpdate(ctx context.Context, batch bulkWriteBatch) (opera
 		Database(bw.collection.db.name).Collection(bw.collection.name).
 		Deployment(bw.collection.client.deployment).Crypt(bw.collection.client.cryptFLE).Hint(hasHint).
 		ArrayFilters(hasArrayFilters).ServerAPI(bw.collection.client.serverAPI).
-		Timeout(bw.collection.client.timeout).Logger(bw.collection.client.logger)
+		Timeout(bw.collection.client.timeout).Logger(bw.collection.client.logger).
+		Authenticator(bw.collection.client.authenticator)
 	if bw.comment != nil {
 		comment, err := marshalValue(bw.comment, bw.collection.bsonOpts, bw.collection.registry)
 		if err != nil {
@@ -418,19 +420,23 @@ func (bw *bulkWrite) runUpdate(ctx context.Context, batch bulkWriteBatch) (opera
 	return op.Result(), err
 }
 
-func createUpdateDoc(
-	filter interface{},
-	update interface{},
-	hint interface{},
-	arrayFilters *options.ArrayFilters,
-	collation *options.Collation,
-	upsert *bool,
-	multi bool,
-	checkDollarKey bool,
-	bsonOpts *options.BSONOptions,
-	registry *bsoncodec.Registry,
-) (bsoncore.Document, error) {
-	f, err := marshal(filter, bsonOpts, registry)
+type updateDoc struct {
+	filter         interface{}
+	update         interface{}
+	hint           interface{}
+	sort           interface{}
+	arrayFilters   []interface{}
+	collation      *options.Collation
+	upsert         *bool
+	multi          bool
+	checkDollarKey bool
+}
+
+func (doc updateDoc) marshal(bsonOpts *options.BSONOptions, registry *bson.Registry) (bsoncore.Document, error) {
+	if doc.filter == nil {
+		return nil, fmt.Errorf("update filter cannot be nil")
+	}
+	f, err := marshal(doc.filter, bsonOpts, registry)
 	if err != nil {
 		return nil, err
 	}
@@ -438,42 +444,49 @@ func createUpdateDoc(
 	uidx, updateDoc := bsoncore.AppendDocumentStart(nil)
 	updateDoc = bsoncore.AppendDocumentElement(updateDoc, "q", f)
 
-	u, err := marshalUpdateValue(update, bsonOpts, registry, checkDollarKey)
+	u, err := marshalUpdateValue(doc.update, bsonOpts, registry, doc.checkDollarKey)
 	if err != nil {
 		return nil, err
 	}
 
 	updateDoc = bsoncore.AppendValueElement(updateDoc, "u", u)
 
-	if multi {
-		updateDoc = bsoncore.AppendBooleanElement(updateDoc, "multi", multi)
+	if doc.multi {
+		updateDoc = bsoncore.AppendBooleanElement(updateDoc, "multi", doc.multi)
+	}
+	if doc.sort != nil {
+		if isUnorderedMap(doc.sort) {
+			return nil, ErrMapForOrderedArgument{"sort"}
+		}
+		s, err := marshal(doc.sort, bsonOpts, registry)
+		if err != nil {
+			return nil, err
+		}
+		updateDoc = bsoncore.AppendDocumentElement(updateDoc, "sort", s)
 	}
 
-	if arrayFilters != nil {
+	if doc.arrayFilters != nil {
 		reg := registry
-		if arrayFilters.Registry != nil {
-			reg = arrayFilters.Registry
-		}
-		arr, err := marshalValue(arrayFilters.Filters, bsonOpts, reg)
+		arr, err := marshalValue(doc.arrayFilters, bsonOpts, reg)
 		if err != nil {
 			return nil, err
 		}
 		updateDoc = bsoncore.AppendArrayElement(updateDoc, "arrayFilters", arr.Data)
 	}
 
-	if collation != nil {
-		updateDoc = bsoncore.AppendDocumentElement(updateDoc, "collation", bsoncore.Document(collation.ToDocument()))
+	if doc.collation != nil {
+		updateDoc = bsoncore.AppendDocumentElement(updateDoc, "collation", bsoncore.Document(toDocument(doc.collation)))
 	}
 
-	if upsert != nil {
-		updateDoc = bsoncore.AppendBooleanElement(updateDoc, "upsert", *upsert)
+	if doc.upsert != nil {
+		updateDoc = bsoncore.AppendBooleanElement(updateDoc, "upsert", *doc.upsert)
 	}
 
-	if hint != nil {
-		if isUnorderedMap(hint) {
+	if doc.hint != nil {
+		if isUnorderedMap(doc.hint) {
 			return nil, ErrMapForOrderedArgument{"hint"}
 		}
-		hintVal, err := marshalValue(hint, bsonOpts, registry)
+		hintVal, err := marshalValue(doc.hint, bsonOpts, registry)
 		if err != nil {
 			return nil, err
 		}

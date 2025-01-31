@@ -4,33 +4,43 @@
 // not use this file except in compliance with the License. You may obtain
 // a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 
-// Package topology contains types that handles the discovery, monitoring, and selection
-// of servers. This package is designed to expose enough inner workings of service discovery
-// and monitoring to allow low level applications to have fine grained control, while hiding
-// most of the detailed implementation of the algorithms.
-package topology // import "go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+// Package topology is intended for internal use only. It is made available to
+// facilitate use cases that require access to internal MongoDB driver
+// functionality and state. The API of this package is not stable and there is
+// no backward compatibility guarantee.
+//
+// WARNING: THIS PACKAGE IS EXPERIMENTAL AND MAY BE MODIFIED OR REMOVED WITHOUT
+// NOTICE! USE WITH EXTREME CAUTION!
+//
+// Package topology contains types that handles the discovery, monitoring, and
+// selection of servers. This package is designed to expose enough inner
+// workings of service discovery and monitoring to allow low level applications
+// to have fine grained control, while hiding most of the detailed
+// implementation of the algorithms.
+package topology
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/logger"
-	"go.mongodb.org/mongo-driver/internal/randutil"
-	"go.mongodb.org/mongo-driver/mongo/address"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/dns"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
+	"go.mongodb.org/mongo-driver/v2/internal/logger"
+	"go.mongodb.org/mongo-driver/v2/internal/randutil"
+	"go.mongodb.org/mongo-driver/v2/mongo/address"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/dns"
 )
 
 // Topology state constants.
@@ -52,10 +62,6 @@ var ErrTopologyClosed = errors.New("topology is closed")
 // ErrTopologyConnected is returned whena  user attempts to Connect to an
 // already connected Topology.
 var ErrTopologyConnected = errors.New("topology is connected or connecting")
-
-// ErrServerSelectionTimeout is returned from server selection when the server
-// selection process took longer than allowed by the timeout.
-var ErrServerSelectionTimeout = errors.New("server selection timeout")
 
 // MonitorMode represents the way in which a server is monitored.
 type MonitorMode uint8
@@ -87,6 +93,8 @@ type Topology struct {
 	rescanSRVInterval time.Duration
 	pollHeartbeatTime atomic.Value // holds a bool
 
+	hosts []string
+
 	updateCallback updateTopologyCallback
 	fsm            *fsm
 
@@ -98,7 +106,7 @@ type Topology struct {
 	subscriptionsClosed bool
 	subLock             sync.Mutex
 
-	// We should redesign how we Connect and handle individal servers. This is
+	// We should redesign how we Connect and handle individual servers. This is
 	// too difficult to maintain and it's rather easy to accidentally access
 	// the servers without acquiring the lock or checking if the servers are
 	// closed. This lock should also be an RWMutex.
@@ -106,25 +114,13 @@ type Topology struct {
 	serversClosed bool
 	servers       map[address.Address]*Server
 
-	id primitive.ObjectID
+	id bson.ObjectID
 }
 
 var (
 	_ driver.Deployment = &Topology{}
 	_ driver.Subscriber = &Topology{}
 )
-
-type serverSelectionState struct {
-	selector    description.ServerSelector
-	timeoutChan <-chan time.Time
-}
-
-func newServerSelectionState(selector description.ServerSelector, timeoutChan <-chan time.Time) serverSelectionState {
-	return serverSelectionState{
-		selector:    selector,
-		timeoutChan: timeoutChan,
-	}
-}
 
 // New creates a new topology. A "nil" config is interpreted as the default configuration.
 func New(cfg *Config) (*Topology, error) {
@@ -145,15 +141,20 @@ func New(cfg *Config) (*Topology, error) {
 		subscribers:       make(map[uint64]chan description.Topology),
 		servers:           make(map[address.Address]*Server),
 		dnsResolver:       dns.DefaultResolver,
-		id:                primitive.NewObjectID(),
+		id:                bson.NewObjectID(),
 	}
 	t.desc.Store(description.Topology{})
 	t.updateCallback = func(desc description.Server) description.Server {
-		return t.apply(context.TODO(), desc)
+		return t.apply(context.Background(), desc)
 	}
 
 	if t.cfg.URI != "" {
-		t.pollingRequired = strings.HasPrefix(t.cfg.URI, "mongodb+srv://") && !t.cfg.LoadBalanced
+		connStr, err := connstring.Parse(t.cfg.URI)
+		if err != nil {
+			return nil, err
+		}
+		t.pollingRequired = (connStr.Scheme == connstring.SchemeMongoDBSRV) && !t.cfg.LoadBalanced
+		t.hosts = connStr.RawHosts
 	}
 
 	t.publishTopologyOpeningEvent()
@@ -161,19 +162,49 @@ func New(cfg *Config) (*Topology, error) {
 	return t, nil
 }
 
-func mustLogTopologyMessage(topo *Topology) bool {
+func mustLogTopologyMessage(topo *Topology, level logger.Level) bool {
 	return topo.cfg.logger != nil && topo.cfg.logger.LevelComponentEnabled(
-		logger.LevelDebug, logger.ComponentTopology)
+		level, logger.ComponentTopology)
 }
 
-func logTopologyMessage(topo *Topology, msg string, keysAndValues ...interface{}) {
-	topo.cfg.logger.Print(logger.LevelDebug,
+func logTopologyMessage(topo *Topology, level logger.Level, msg string, keysAndValues ...interface{}) {
+	topo.cfg.logger.Print(level,
 		logger.ComponentTopology,
 		msg,
 		logger.SerializeTopology(logger.Topology{
 			ID:      topo.id,
 			Message: msg,
 		}, keysAndValues...)...)
+}
+
+func logTopologyThirdPartyUsage(topo *Topology, parsedHosts []string) {
+	thirdPartyMessages := [2]string{
+		`You appear to be connected to a CosmosDB cluster. For more information regarding feature compatibility and support please visit https://www.mongodb.com/supportability/cosmosdb`,
+		`You appear to be connected to a DocumentDB cluster. For more information regarding feature compatibility and support please visit https://www.mongodb.com/supportability/documentdb`,
+	}
+
+	thirdPartySuffixes := map[string]int{
+		".cosmos.azure.com":            0,
+		".docdb.amazonaws.com":         1,
+		".docdb-elastic.amazonaws.com": 1,
+	}
+
+	hostSet := make([]bool, len(thirdPartyMessages))
+	for _, host := range parsedHosts {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		for suffix, env := range thirdPartySuffixes {
+			if !strings.HasSuffix(host, suffix) {
+				continue
+			}
+			if hostSet[env] {
+				break
+			}
+			hostSet[env] = true
+			logTopologyMessage(topo, logger.LevelInfo, thirdPartyMessages[env])
+		}
+	}
 }
 
 func mustLogServerSelection(topo *Topology, level logger.Level) bool {
@@ -183,8 +214,8 @@ func mustLogServerSelection(topo *Topology, level logger.Level) bool {
 
 func logServerSelection(
 	ctx context.Context,
-	level logger.Level,
 	topo *Topology,
+	level logger.Level,
 	msg string,
 	srvSelector description.ServerSelector,
 	keysAndValues ...interface{},
@@ -224,7 +255,7 @@ func logServerSelectionSucceeded(
 
 	portInt64, _ := strconv.ParseInt(port, 10, 32)
 
-	logServerSelection(ctx, logger.LevelDebug, topo, logger.ServerSelectionSucceeded, srvSelector,
+	logServerSelection(ctx, topo, logger.LevelDebug, logger.ServerSelectionSucceeded, srvSelector,
 		logger.KeyServerHost, host,
 		logger.KeyServerPort, portInt64)
 }
@@ -235,7 +266,7 @@ func logServerSelectionFailed(
 	srvSelector description.ServerSelector,
 	err error,
 ) {
-	logServerSelection(ctx, logger.LevelDebug, topo, logger.ServerSelectionFailed, srvSelector,
+	logServerSelection(ctx, topo, logger.LevelDebug, logger.ServerSelectionFailed, srvSelector,
 		logger.KeyFailure, err.Error())
 }
 
@@ -254,17 +285,17 @@ func (t *Topology) Connect() error {
 	// specified, in which case the initial type is Single.
 	if t.cfg.ReplicaSetName != "" {
 		t.fsm.SetName = t.cfg.ReplicaSetName
-		t.fsm.Kind = description.ReplicaSetNoPrimary
+		t.fsm.Kind = description.TopologyKindReplicaSetNoPrimary
 	}
 
 	// A direct connection unconditionally sets the topology type to Single.
 	if t.cfg.Mode == SingleMode {
-		t.fsm.Kind = description.Single
+		t.fsm.Kind = description.TopologyKindSingle
 	}
 
 	for _, a := range t.cfg.SeedList {
 		addr := address.Address(a).Canonicalize()
-		t.fsm.Servers = append(t.fsm.Servers, description.NewDefaultServer(addr))
+		t.fsm.Servers = append(t.fsm.Servers, newServerDescriptionFromError(addr, nil, nil))
 	}
 
 	switch {
@@ -275,7 +306,7 @@ func (t *Topology) Connect() error {
 		// monitoring routines in this mode, so we have to mock state changes.
 
 		// Transition from Unknown with no servers to LoadBalanced with a single Unknown server.
-		t.fsm.Kind = description.LoadBalanced
+		t.fsm.Kind = description.TopologyKindLoadBalanced
 		t.publishTopologyDescriptionChangedEvent(description.Topology{}, t.fsm.Topology)
 
 		addr := address.Address(t.cfg.SeedList[0]).Canonicalize()
@@ -300,12 +331,8 @@ func (t *Topology) Connect() error {
 		// server monitoring goroutines.
 
 		newDesc := description.Topology{
-			Kind:                     t.fsm.Kind,
-			Servers:                  t.fsm.Servers,
-			SessionTimeoutMinutesPtr: t.fsm.SessionTimeoutMinutesPtr,
-
-			// TODO(GODRIVER-2885): This field can be removed once
-			// legacy SessionTimeoutMinutes is removed.
+			Kind:                  t.fsm.Kind,
+			Servers:               t.fsm.Servers,
 			SessionTimeoutMinutes: t.fsm.SessionTimeoutMinutes,
 		}
 		t.desc.Store(newDesc)
@@ -321,22 +348,21 @@ func (t *Topology) Connect() error {
 	}
 
 	t.serversLock.Unlock()
+	if mustLogTopologyMessage(t, logger.LevelInfo) {
+		logTopologyThirdPartyUsage(t, t.hosts)
+	}
 	if t.pollingRequired {
-		uri, err := url.Parse(t.cfg.URI)
-		if err != nil {
-			return err
-		}
 		// sanity check before passing the hostname to resolver
-		if parsedHosts := strings.Split(uri.Host, ","); len(parsedHosts) != 1 {
+		if len(t.hosts) != 1 {
 			return fmt.Errorf("URI with SRV must include one and only one hostname")
 		}
-		_, _, err = net.SplitHostPort(uri.Host)
+		_, _, err = net.SplitHostPort(t.hosts[0])
 		if err == nil {
 			// we were able to successfully extract a port from the host,
 			// but should not be able to when using SRV
 			return fmt.Errorf("URI with srv must not include a port number")
 		}
-		go t.pollSRVRecords(uri.Host)
+		go t.pollSRVRecords(t.hosts[0])
 		t.pollingwg.Add(1)
 	}
 
@@ -461,9 +487,8 @@ func (t *Topology) RequestImmediateCheck() {
 	t.serversLock.Unlock()
 }
 
-// SelectServer selects a server with given a selector. SelectServer complies with the
-// server selection spec, and will time out after serverSelectionTimeout or when the
-// parent context is done.
+// SelectServer selects a server with given a selector, returning the remaining
+// computedServerSelectionTimeout.
 func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelector) (driver.Server, error) {
 	if atomic.LoadInt64(&t.state) != topologyConnected {
 		if mustLogServerSelection(t, logger.LevelDebug) {
@@ -472,17 +497,9 @@ func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelect
 
 		return nil, ErrTopologyClosed
 	}
-	var ssTimeoutCh <-chan time.Time
-
-	if t.cfg.ServerSelectionTimeout > 0 {
-		ssTimeout := time.NewTimer(t.cfg.ServerSelectionTimeout)
-		ssTimeoutCh = ssTimeout.C
-		defer ssTimeout.Stop()
-	}
 
 	var doneOnce bool
 	var sub *driver.Subscription
-	selectionState := newServerSelectionState(ss, ssTimeoutCh)
 
 	// Record the start time.
 	startTime := time.Now()
@@ -492,12 +509,12 @@ func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelect
 
 		if !doneOnce {
 			if mustLogServerSelection(t, logger.LevelDebug) {
-				logServerSelection(ctx, logger.LevelDebug, t, logger.ServerSelectionStarted, ss)
+				logServerSelection(ctx, t, logger.LevelDebug, logger.ServerSelectionStarted, ss)
 			}
 
 			// for the first pass, select a server from the current description.
 			// this improves selection speed for up-to-date topology descriptions.
-			suitable, selectErr = t.selectServerFromDescription(t.Description(), selectionState)
+			suitable, selectErr = t.selectServerFromDescription(t.Description(), ss)
 			doneOnce = true
 		} else {
 			// if the first pass didn't select a server, the previous description did not contain a suitable server, so
@@ -512,10 +529,10 @@ func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelect
 
 					return nil, err
 				}
-				defer t.Unsubscribe(sub)
+				defer func() { _ = t.Unsubscribe(sub) }()
 			}
 
-			suitable, selectErr = t.selectServerFromSubscription(ctx, sub.Updates, selectionState)
+			suitable, selectErr = t.selectServerFromSubscription(ctx, sub.Updates, ss)
 		}
 		if selectErr != nil {
 			if mustLogServerSelection(t, logger.LevelDebug) {
@@ -531,7 +548,7 @@ func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelect
 				elapsed := time.Since(startTime)
 				remainingTimeMS := t.cfg.ServerSelectionTimeout - elapsed
 
-				logServerSelection(ctx, logger.LevelInfo, t, logger.ServerSelectionWaiting, ss,
+				logServerSelection(ctx, t, logger.LevelInfo, logger.ServerSelectionWaiting, ss,
 					logger.KeyRemainingTimeMS, remainingTimeMS.Milliseconds())
 			}
 
@@ -662,20 +679,22 @@ func (t *Topology) FindServer(selected description.Server) (*SelectedServer, err
 // selectServerFromSubscription loops until a topology description is available for server selection. It returns
 // when the given context expires, server selection timeout is reached, or a description containing a selectable
 // server is available.
-func (t *Topology) selectServerFromSubscription(ctx context.Context, subscriptionCh <-chan description.Topology,
-	selectionState serverSelectionState) ([]description.Server, error) {
+func (t *Topology) selectServerFromSubscription(
+	ctx context.Context,
+	subscriptionCh <-chan description.Topology,
+	srvSelector description.ServerSelector,
+) ([]description.Server, error) {
 
 	current := t.Description()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ServerSelectionError{Wrapped: ctx.Err(), Desc: current}
-		case <-selectionState.timeoutChan:
-			return nil, ServerSelectionError{Wrapped: ErrServerSelectionTimeout, Desc: current}
 		case current = <-subscriptionCh:
+		default:
 		}
 
-		suitable, err := t.selectServerFromDescription(current, selectionState)
+		suitable, err := t.selectServerFromDescription(current, srvSelector)
 		if err != nil {
 			return nil, err
 		}
@@ -688,8 +707,10 @@ func (t *Topology) selectServerFromSubscription(ctx context.Context, subscriptio
 }
 
 // selectServerFromDescription process the given topology description and returns a slice of suitable servers.
-func (t *Topology) selectServerFromDescription(desc description.Topology,
-	selectionState serverSelectionState) ([]description.Server, error) {
+func (t *Topology) selectServerFromDescription(
+	desc description.Topology,
+	srvSelector description.ServerSelector,
+) ([]description.Server, error) {
 
 	// Unlike selectServerFromSubscription, this code path does not check ctx.Done or selectionState.timeoutChan because
 	// selecting a server from a description is not a blocking operation.
@@ -701,7 +722,7 @@ func (t *Topology) selectServerFromDescription(desc description.Topology,
 	// If the topology kind is LoadBalanced, the LB is the only server and it is always considered selectable. The
 	// selectors exported by the driver should already return the LB as a candidate, so this but this check ensures that
 	// the LB is always selectable even if a user of the low-level driver provides a custom selector.
-	if desc.Kind == description.LoadBalanced {
+	if desc.Kind == description.TopologyKindLoadBalanced {
 		return desc.Servers, nil
 	}
 
@@ -717,7 +738,7 @@ func (t *Topology) selectServerFromDescription(desc description.Topology,
 		allowed[i] = desc.Servers[idx]
 	}
 
-	suitable, err := selectionState.selector.SelectServer(desc, allowed)
+	suitable, err := srvSelector.SelectServer(desc, allowed)
 	if err != nil {
 		return nil, ServerSelectionError{Wrapped: err, Desc: desc}
 	}
@@ -727,7 +748,7 @@ func (t *Topology) selectServerFromDescription(desc description.Topology,
 func (t *Topology) pollSRVRecords(hosts string) {
 	defer t.pollingwg.Done()
 
-	serverConfig := newServerConfig(t.cfg.ServerOpts...)
+	serverConfig := newServerConfig(t.cfg.ConnectTimeout, t.cfg.ServerOpts...)
 	heartbeatInterval := serverConfig.heartbeatInterval
 
 	pollTicker := time.NewTicker(t.rescanSRVInterval)
@@ -749,7 +770,7 @@ func (t *Topology) pollSRVRecords(hosts string) {
 			return
 		}
 		topoKind := t.Description().Kind
-		if !(topoKind == description.Unknown || topoKind == description.Sharded) {
+		if !(topoKind == description.Unknown || topoKind == description.TopologyKindSharded) {
 			break
 		}
 
@@ -776,6 +797,38 @@ func (t *Topology) pollSRVRecords(hosts string) {
 	}
 	<-t.pollingDone
 	doneOnce = true
+}
+
+// equalTopologies compares two topology descriptions and returns true if they
+// are equal.
+func equalTopologies(topo1, topo2 description.Topology) bool {
+	if topo1.Kind != topo2.Kind {
+		return false
+	}
+
+	topoServers := make(map[string]description.Server, len(topo1.Servers))
+	for _, s := range topo1.Servers {
+		topoServers[s.Addr.String()] = s
+	}
+
+	otherServers := make(map[string]description.Server, len(topo2.Servers))
+	for _, s := range topo2.Servers {
+		otherServers[s.Addr.String()] = s
+	}
+
+	if len(topoServers) != len(otherServers) {
+		return false
+	}
+
+	for _, server := range topoServers {
+		otherServer := otherServers[server.Addr.String()]
+
+		if !driverutil.EqualServers(server, otherServer) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (t *Topology) processSRVResults(parsedHosts []string) bool {
@@ -828,17 +881,13 @@ func (t *Topology) processSRVResults(parsedHosts []string) bool {
 
 	// store new description
 	newDesc := description.Topology{
-		Kind:                     t.fsm.Kind,
-		Servers:                  t.fsm.Servers,
-		SessionTimeoutMinutesPtr: t.fsm.SessionTimeoutMinutesPtr,
-
-		// TODO(GODRIVER-2885): This field can be removed once legacy
-		// SessionTimeoutMinutes is removed.
+		Kind:                  t.fsm.Kind,
+		Servers:               t.fsm.Servers,
 		SessionTimeoutMinutes: t.fsm.SessionTimeoutMinutes,
 	}
 	t.desc.Store(newDesc)
 
-	if !prev.Equal(newDesc) {
+	if !equalTopologies(prev, newDesc) {
 		t.publishTopologyDescriptionChangedEvent(prev, newDesc)
 	}
 
@@ -869,14 +918,14 @@ func (t *Topology) apply(ctx context.Context, desc description.Server) descripti
 
 	prev := t.fsm.Topology
 	oldDesc := t.fsm.Servers[ind]
-	if oldDesc.TopologyVersion.CompareToIncoming(desc.TopologyVersion) > 0 {
+	if driverutil.CompareTopologyVersions(oldDesc.TopologyVersion, desc.TopologyVersion) > 0 {
 		return oldDesc
 	}
 
 	var current description.Topology
 	current, desc = t.fsm.apply(desc)
 
-	if !oldDesc.Equal(desc) {
+	if !driverutil.EqualServers(oldDesc, desc) {
 		t.publishServerDescriptionChangedEvent(oldDesc, desc)
 	}
 
@@ -899,7 +948,7 @@ func (t *Topology) apply(ctx context.Context, desc description.Server) descripti
 	}
 
 	t.desc.Store(current)
-	if !prev.Equal(current) {
+	if !equalTopologies(prev, current) {
 		t.publishTopologyDescriptionChangedEvent(prev, current)
 	}
 
@@ -922,7 +971,7 @@ func (t *Topology) addServer(addr address.Address) error {
 		return nil
 	}
 
-	svr, err := ConnectServer(addr, t.updateCallback, t.id, t.cfg.ServerOpts...)
+	svr, err := ConnectServer(addr, t.updateCallback, t.id, t.cfg.ConnectTimeout, t.cfg.ServerOpts...)
 	if err != nil {
 		return err
 	}
@@ -950,8 +999,8 @@ func (t *Topology) publishServerDescriptionChangedEvent(prev description.Server,
 	serverDescriptionChanged := &event.ServerDescriptionChangedEvent{
 		Address:             current.Addr,
 		TopologyID:          t.id,
-		PreviousDescription: prev,
-		NewDescription:      current,
+		PreviousDescription: newEventServerDescription(prev),
+		NewDescription:      newEventServerDescription(current),
 	}
 
 	if t.cfg.ServerMonitor != nil && t.cfg.ServerMonitor.ServerDescriptionChanged != nil {
@@ -970,7 +1019,7 @@ func (t *Topology) publishServerClosedEvent(addr address.Address) {
 		t.cfg.ServerMonitor.ServerClosed(serverClosed)
 	}
 
-	if mustLogTopologyMessage(t) {
+	if mustLogTopologyMessage(t, logger.LevelDebug) {
 		serverHost, serverPort, err := net.SplitHostPort(addr.String())
 		if err != nil {
 			serverHost = addr.String()
@@ -979,7 +1028,7 @@ func (t *Topology) publishServerClosedEvent(addr address.Address) {
 
 		portInt64, _ := strconv.ParseInt(serverPort, 10, 32)
 
-		logTopologyMessage(t, logger.TopologyServerClosed,
+		logTopologyMessage(t, logger.LevelDebug, logger.TopologyServerClosed,
 			logger.KeyServerHost, serverHost,
 			logger.KeyServerPort, portInt64)
 	}
@@ -989,16 +1038,16 @@ func (t *Topology) publishServerClosedEvent(addr address.Address) {
 func (t *Topology) publishTopologyDescriptionChangedEvent(prev description.Topology, current description.Topology) {
 	topologyDescriptionChanged := &event.TopologyDescriptionChangedEvent{
 		TopologyID:          t.id,
-		PreviousDescription: prev,
-		NewDescription:      current,
+		PreviousDescription: newEventServerTopology(prev),
+		NewDescription:      newEventServerTopology(current),
 	}
 
 	if t.cfg.ServerMonitor != nil && t.cfg.ServerMonitor.TopologyDescriptionChanged != nil {
 		t.cfg.ServerMonitor.TopologyDescriptionChanged(topologyDescriptionChanged)
 	}
 
-	if mustLogTopologyMessage(t) {
-		logTopologyMessage(t, logger.TopologyDescriptionChanged,
+	if mustLogTopologyMessage(t, logger.LevelDebug) {
+		logTopologyMessage(t, logger.LevelDebug, logger.TopologyDescriptionChanged,
 			logger.KeyPreviousDescription, prev.String(),
 			logger.KeyNewDescription, current.String())
 	}
@@ -1014,8 +1063,8 @@ func (t *Topology) publishTopologyOpeningEvent() {
 		t.cfg.ServerMonitor.TopologyOpening(topologyOpening)
 	}
 
-	if mustLogTopologyMessage(t) {
-		logTopologyMessage(t, logger.TopologyOpening)
+	if mustLogTopologyMessage(t, logger.LevelDebug) {
+		logTopologyMessage(t, logger.LevelDebug, logger.TopologyOpening)
 	}
 }
 
@@ -1029,7 +1078,74 @@ func (t *Topology) publishTopologyClosedEvent() {
 		t.cfg.ServerMonitor.TopologyClosed(topologyClosed)
 	}
 
-	if mustLogTopologyMessage(t) {
-		logTopologyMessage(t, logger.TopologyClosed)
+	if mustLogTopologyMessage(t, logger.LevelDebug) {
+		logTopologyMessage(t, logger.LevelDebug, logger.TopologyClosed)
 	}
+}
+
+// GetServerSelectionTimeout returns the server selection timeout defined on
+// the client options.
+func (t *Topology) GetServerSelectionTimeout() time.Duration {
+	if t.cfg == nil {
+		return 0
+	}
+
+	return t.cfg.ServerSelectionTimeout
+}
+
+func newEventServerDescription(srv description.Server) event.ServerDescription {
+	evtSrv := event.ServerDescription{
+		Addr:                  srv.Addr,
+		Arbiters:              srv.Arbiters,
+		Compression:           srv.Compression,
+		CanonicalAddr:         srv.CanonicalAddr,
+		ElectionID:            srv.ElectionID,
+		IsCryptd:              srv.IsCryptd,
+		HelloOK:               srv.HelloOK,
+		Hosts:                 srv.Hosts,
+		Kind:                  srv.Kind.String(),
+		LastWriteTime:         srv.LastWriteTime,
+		MaxBatchCount:         srv.MaxBatchCount,
+		MaxDocumentSize:       srv.MaxDocumentSize,
+		MaxMessageSize:        srv.MaxMessageSize,
+		Members:               srv.Members,
+		Passive:               srv.Passive,
+		Passives:              srv.Passives,
+		Primary:               srv.Primary,
+		ReadOnly:              srv.ReadOnly,
+		ServiceID:             srv.ServiceID,
+		SessionTimeoutMinutes: srv.SessionTimeoutMinutes,
+		SetName:               srv.SetName,
+		SetVersion:            srv.SetVersion,
+		Tags:                  srv.Tags,
+	}
+
+	if srv.WireVersion != nil {
+		evtSrv.MaxWireVersion = srv.WireVersion.Max
+		evtSrv.MinWireVersion = srv.WireVersion.Min
+	}
+
+	if srv.TopologyVersion != nil {
+		evtSrv.TopologyVersionProcessID = srv.TopologyVersion.ProcessID
+		evtSrv.TopologyVersionCounter = srv.TopologyVersion.Counter
+	}
+
+	return evtSrv
+}
+
+func newEventServerTopology(topo description.Topology) event.TopologyDescription {
+	evtSrvs := make([]event.ServerDescription, len(topo.Servers))
+	for idx, srv := range topo.Servers {
+		evtSrvs[idx] = newEventServerDescription(srv)
+	}
+
+	evtTopo := event.TopologyDescription{
+		Servers:               evtSrvs,
+		SetName:               topo.SetName,
+		Kind:                  topo.Kind.String(),
+		SessionTimeoutMinutes: topo.SessionTimeoutMinutes,
+		CompatibilityErr:      topo.CompatibilityErr,
+	}
+
+	return evtTopo
 }

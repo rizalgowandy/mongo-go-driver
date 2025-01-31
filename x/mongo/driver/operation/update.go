@@ -12,20 +12,20 @@ import (
 	"fmt"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
-	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/driverutil"
-	"go.mongodb.org/mongo-driver/internal/logger"
-	"go.mongodb.org/mongo-driver/mongo/description"
-	"go.mongodb.org/mongo-driver/mongo/writeconcern"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
+	"go.mongodb.org/mongo-driver/v2/internal/logger"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // Update performs an update operation.
 type Update struct {
+	authenticator            driver.Authenticator
 	bypassDocumentValidation *bool
 	comment                  bsoncore.Value
 	ordered                  *bool
@@ -123,8 +123,8 @@ func NewUpdate(updates ...bsoncore.Document) *Update {
 // Result returns the result of executing this operation.
 func (u *Update) Result() UpdateResult { return u.result }
 
-func (u *Update) processResponse(info driver.ResponseInfo) error {
-	ur, err := buildUpdateResult(info.ServerResponse)
+func (u *Update) processResponse(_ context.Context, resp bsoncore.Document, info driver.ResponseInfo) error {
+	ur, err := buildUpdateResult(resp)
 
 	u.result.N += ur.N
 	u.result.NModified += ur.NModified
@@ -167,6 +167,7 @@ func (u *Update) Execute(ctx context.Context) error {
 		Timeout:           u.timeout,
 		Logger:            u.logger,
 		Name:              driverutil.UpdateOp,
+		Authenticator:     u.authenticator,
 	}.Execute(ctx)
 
 }
@@ -174,11 +175,11 @@ func (u *Update) Execute(ctx context.Context) error {
 func (u *Update) command(dst []byte, desc description.SelectedServer) ([]byte, error) {
 	dst = bsoncore.AppendStringElement(dst, "update", u.collection)
 	if u.bypassDocumentValidation != nil &&
-		(desc.WireVersion != nil && desc.WireVersion.Includes(4)) {
+		(desc.WireVersion != nil && driverutil.VersionRangeIncludes(*desc.WireVersion, 4)) {
 
 		dst = bsoncore.AppendBooleanElement(dst, "bypassDocumentValidation", *u.bypassDocumentValidation)
 	}
-	if u.comment.Type != bsontype.Type(0) {
+	if u.comment.Type != bsoncore.Type(0) {
 		dst = bsoncore.AppendValueElement(dst, "comment", u.comment)
 	}
 	if u.ordered != nil {
@@ -187,7 +188,7 @@ func (u *Update) command(dst []byte, desc description.SelectedServer) ([]byte, e
 	}
 	if u.hint != nil && *u.hint {
 
-		if desc.WireVersion == nil || !desc.WireVersion.Includes(5) {
+		if desc.WireVersion == nil || !driverutil.VersionRangeIncludes(*desc.WireVersion, 5) {
 			return nil, errors.New("the 'hint' command parameter requires a minimum server wire version of 5")
 		}
 		if !u.writeConcern.Acknowledged() {
@@ -195,7 +196,7 @@ func (u *Update) command(dst []byte, desc description.SelectedServer) ([]byte, e
 		}
 	}
 	if u.arrayFilters != nil && *u.arrayFilters {
-		if desc.WireVersion == nil || !desc.WireVersion.Includes(6) {
+		if desc.WireVersion == nil || !driverutil.VersionRangeIncludes(*desc.WireVersion, 6) {
 			return nil, errors.New("the 'arrayFilters' command parameter requires a minimum server wire version of 6")
 		}
 	}
@@ -412,5 +413,15 @@ func (u *Update) Logger(logger *logger.Logger) *Update {
 	}
 
 	u.logger = logger
+	return u
+}
+
+// Authenticator sets the authenticator to use for this operation.
+func (u *Update) Authenticator(authenticator driver.Authenticator) *Update {
+	if u == nil {
+		u = new(Update)
+	}
+
+	u.authenticator = authenticator
 	return u
 }
